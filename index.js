@@ -16,26 +16,13 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 
-// Keepalive ping cada 30s para mantener conexión Railway activa
-const keepAliveInterval = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, 30000);
-
-wss.on('close', () => clearInterval(keepAliveInterval));
-
 wss.on('connection', (twilioWs, req) => {
-  twilioWs.isAlive = true;
-  twilioWs.on('pong', () => { twilioWs.isAlive = true; });
-
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
 
-  const url = new URL(req.url, `http://localhost`);
+  // Twilio envía params en el body del mensaje start, no en la URL
+  const url = new URL(req.url, 'http://localhost');
   const callSid = url.searchParams.get('call_sid') ?? '';
-  const phoneParam = url.searchParams.get('phone') ?? '';
+  const phoneParam = decodeURIComponent(url.searchParams.get('phone') ?? '');
 
   console.log(`[voice-stream] WS conectado callSid=${callSid} phone=${phoneParam}`);
 
@@ -47,23 +34,39 @@ wss.on('connection', (twilioWs, req) => {
   let audioBuffer = [];
   let isSpeaking = false;
   let va = null;
+  let resolvedCallSid = callSid;
+  let resolvedPhone = phoneParam;
 
-  supabase
-    .from('voice_assistants')
-    .select('*, assistants(id, name, prompt, llm_model)')
-    .eq('twilio_phone_number', phoneParam)
-    .eq('is_active', true)
-    .single()
-    .then(({ data }) => { va = data; });
+  function loadAssistant(phone) {
+    supabase
+      .from('voice_assistants')
+      .select('*, assistants(id, name, prompt, llm_model)')
+      .eq('twilio_phone_number', phone)
+      .eq('is_active', true)
+      .single()
+      .then(({ data }) => {
+        va = data;
+        console.log(`[voice-stream] Asistente cargado: ${va?.assistants?.name}`);
+      });
+  }
+
+  if (resolvedPhone) loadAssistant(resolvedPhone);
 
   function connectDeepgram() {
     const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
-      model: 'nova-2', language: 'es', encoding: 'mulaw',
-      sample_rate: '8000', channels: '1',
-      interim_results: 'false', endpointing: '300',
-    });
+      model: 'nova-2',
+      language: 'es',
+      encoding: 'mulaw',
+      sample_rate: '8000',
+      channels: '1',
+      interim_results: 'false',
+      endpointing: '300',
+    }).toString();
 
-    deepgramWs = new WebSocket(dgUrl, ['token', DEEPGRAM_API_KEY]);
+    // Usar Authorization header en lugar de subprotocol
+    deepgramWs = new WebSocket(dgUrl, {
+      headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
+    });
 
     deepgramWs.on('open', () => {
       console.log('[Deepgram] Conectado');
@@ -81,31 +84,45 @@ wss.on('connection', (twilioWs, req) => {
       if (isFinal && transcript.trim() && !isSpeaking) {
         console.log(`[Deepgram] Transcript: "${transcript}"`);
         isSpeaking = true;
-        await handleUserSpeech(transcript, callSid, va, streamSid, twilioWs, supabase);
+        await handleUserSpeech(transcript, resolvedCallSid, va, streamSid, twilioWs, supabase);
         isSpeaking = false;
       }
     });
 
-    deepgramWs.on('error', (e) => console.error('[Deepgram] Error:', e));
+    deepgramWs.on('error', (e) => console.error('[Deepgram] Error:', e.message));
     deepgramWs.on('close', () => console.log('[Deepgram] Cerrado'));
   }
 
   connectDeepgram();
 
   twilioWs.on('message', async (data) => {
-    const msg = JSON.parse(data.toString());
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    if (msg.event === 'connected') console.log('[Twilio] connected');
+    if (msg.event === 'connected') {
+      console.log('[Twilio] connected');
+    }
 
     if (msg.event === 'start') {
       streamSid = msg.start?.streamSid ?? '';
-      console.log(`[Twilio] start streamSid=${streamSid}`);
-      if (va) {
-        const name = va.assistants?.name ?? 'Asistente';
-        isSpeaking = true;
-        await streamElevenLabsToTwilio(`Hola, soy ${name}. ¿En qué puedo ayudarte?`, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs);
-        isSpeaking = false;
+      // Twilio envía callSid y phone en customParameters
+      const params = msg.start?.customParameters ?? {};
+      if (params.callSid) resolvedCallSid = params.callSid;
+      if (params.phone) {
+        resolvedPhone = params.phone;
+        if (!va) loadAssistant(resolvedPhone);
       }
+      console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} phone=${resolvedPhone}`);
+
+      // Esperar a que va esté cargado
+      setTimeout(async () => {
+        if (va) {
+          const name = va.assistants?.name ?? 'Asistente';
+          isSpeaking = true;
+          await streamElevenLabsToTwilio(`Hola, soy ${name}. ¿En qué puedo ayudarte?`, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs);
+          isSpeaking = false;
+        }
+      }, 500);
     }
 
     if (msg.event === 'media') {
@@ -122,11 +139,11 @@ wss.on('connection', (twilioWs, req) => {
       deepgramWs?.close();
       await supabase.from('voice_calls').update({
         status: 'completed', ended_at: new Date().toISOString(),
-      }).eq('call_sid', callSid);
+      }).eq('call_sid', resolvedCallSid);
     }
   });
 
-  twilioWs.on('error', (e) => console.error('[Twilio WS] Error:', e));
+  twilioWs.on('error', (e) => console.error('[Twilio WS] Error:', e.message));
   twilioWs.on('close', () => { console.log('[Twilio WS] Cerrado'); deepgramWs?.close(); });
 });
 
@@ -136,6 +153,7 @@ server.listen(PORT, '0.0.0.0', () => {
 
 async function handleUserSpeech(transcript, callSid, va, streamSid, twilioWs, supabase) {
   try {
+    if (!va) { console.error('[handleUserSpeech] va es null'); return; }
     const { data: call } = await supabase.from('voice_calls').select('transcript, turn_count').eq('call_sid', callSid).single();
     const history = call?.transcript ?? [];
     const turnCount = (call?.turn_count ?? 0) + 1;
@@ -145,7 +163,7 @@ async function handleUserSpeech(transcript, callSid, va, streamSid, twilioWs, su
     history.push({ role: 'user', text: transcript, ts: new Date().toISOString() }, { role: 'assistant', text: aiReply, ts: new Date().toISOString() });
     await supabase.from('voice_calls').update({ transcript: history, turn_count: turnCount, last_activity_at: new Date().toISOString() }).eq('call_sid', callSid);
     await streamElevenLabsToTwilio(aiReply, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs);
-  } catch (err) { console.error('[handleUserSpeech] Error:', err); }
+  } catch (err) { console.error('[handleUserSpeech] Error:', err.message); }
 }
 
 async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_5', streamSid, twilioWs) {
@@ -169,7 +187,7 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
     if (twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
     }
-  } catch (err) { console.error('[ElevenLabs stream] Error:', err); }
+  } catch (err) { console.error('[ElevenLabs stream] Error:', err.message); }
 }
 
 async function callOpenAI(systemPrompt, model, userMessage, history = []) {
@@ -181,5 +199,5 @@ async function callOpenAI(systemPrompt, model, userMessage, history = []) {
     });
     const data = await res.json();
     return data.choices?.[0]?.message?.content?.trim() ?? 'Lo siento, ocurrió un error. ¿Puedes repetir?';
-  } catch (err) { console.error('[OpenAI] Exception:', err); return 'Lo siento, ocurrió un error.'; }
+  } catch (err) { console.error('[OpenAI] Exception:', err.message); return 'Lo siento, ocurrió un error.'; }
 }
