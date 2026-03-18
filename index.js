@@ -14,9 +14,23 @@ const server = http.createServer((req, res) => {
   res.end('voice-stream ok');
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ server, perMessageDeflate: false });
+
+// Keepalive ping cada 30s para mantener conexión Railway activa
+const keepAliveInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on('close', () => clearInterval(keepAliveInterval));
 
 wss.on('connection', (twilioWs, req) => {
+  twilioWs.isAlive = true;
+  twilioWs.on('pong', () => { twilioWs.isAlive = true; });
+
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
 
   const url = new URL(req.url, `http://localhost`);
