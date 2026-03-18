@@ -17,6 +17,8 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (twilioWs, req) => {
+  console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
+
   const url = new URL(req.url, `http://localhost`);
   const callSid = url.searchParams.get('call_sid') ?? '';
   const phoneParam = url.searchParams.get('phone') ?? '';
