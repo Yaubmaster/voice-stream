@@ -19,12 +19,11 @@ const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 wss.on('connection', (twilioWs, req) => {
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
 
-  // Twilio envía params en el body del mensaje start, no en la URL
   const url = new URL(req.url, 'http://localhost');
   const callSid = url.searchParams.get('call_sid') ?? '';
   const phoneParam = decodeURIComponent(url.searchParams.get('phone') ?? '');
 
-  console.log(`[voice-stream] WS conectado callSid=${callSid} phone=${phoneParam}`);
+  console.log(`[voice-stream] callSid=${callSid} phone=${phoneParam}`);
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -46,7 +45,7 @@ wss.on('connection', (twilioWs, req) => {
       .single()
       .then(({ data }) => {
         va = data;
-        console.log(`[voice-stream] Asistente cargado: ${va?.assistants?.name}`);
+        console.log(`[voice-stream] Asistente: ${va?.assistants?.name}`);
       });
   }
 
@@ -63,7 +62,6 @@ wss.on('connection', (twilioWs, req) => {
       endpointing: '300',
     }).toString();
 
-    // Usar Authorization header en lugar de subprotocol
     deepgramWs = new WebSocket(dgUrl, {
       headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
     });
@@ -99,13 +97,10 @@ wss.on('connection', (twilioWs, req) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    if (msg.event === 'connected') {
-      console.log('[Twilio] connected');
-    }
+    if (msg.event === 'connected') console.log('[Twilio] connected');
 
     if (msg.event === 'start') {
       streamSid = msg.start?.streamSid ?? '';
-      // Twilio envía callSid y phone en customParameters
       const params = msg.start?.customParameters ?? {};
       if (params.callSid) resolvedCallSid = params.callSid;
       if (params.phone) {
@@ -114,7 +109,6 @@ wss.on('connection', (twilioWs, req) => {
       }
       console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} phone=${resolvedPhone}`);
 
-      // Esperar a que va esté cargado
       setTimeout(async () => {
         if (va) {
           const name = va.assistants?.name ?? 'Asistente';
