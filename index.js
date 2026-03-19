@@ -38,6 +38,7 @@ wss.on('connection', (twilioWs, req) => {
   let resolvedPhone = phoneParam;
 
   function loadAssistant(phone) {
+    console.log(`[loadAssistant] buscando phone="${phone}"`);
     return supabase
       .from('voice_assistants')
       .select('*, assistants(id, name, prompt, llm_model)')
@@ -46,7 +47,7 @@ wss.on('connection', (twilioWs, req) => {
       .single()
       .then(({ data, error }) => {
         va = data;
-        console.log(`[voice-stream] Asistente: ${va?.assistants?.name} error: ${error?.message}`);
+        console.log(`[loadAssistant] resultado: ${JSON.stringify(data)} error: ${error?.message}`);
       });
   }
 
@@ -105,7 +106,7 @@ wss.on('connection', (twilioWs, req) => {
       if (params.phone) {
         resolvedPhone = decodeURIComponent(params.phone).replace(/\s/g, '+');
       }
-      console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} phone=${resolvedPhone}`);
+      console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} phone="${resolvedPhone}"`);
 
       loadAssistant(resolvedPhone).then(() => {
         setTimeout(async () => {
