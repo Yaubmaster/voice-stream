@@ -37,17 +37,22 @@ wss.on('connection', (twilioWs, req) => {
   let resolvedCallSid = callSid;
   let resolvedPhone = phoneParam;
 
+  function normalizePhone(phone) {
+    return phone.replace(/%2B/gi, '+').replace(/%20/gi, '').replace(/\s/g, '');
+  }
+
   function loadAssistant(phone) {
-    console.log(`[loadAssistant] buscando phone="${phone}"`);
+    const normalized = normalizePhone(phone);
+    console.log(`[loadAssistant] buscando phone="${normalized}"`);
     return supabase
       .from('voice_assistants')
       .select('*, assistants(id, name, prompt, llm_model)')
-      .eq('twilio_phone_number', phone)
+      .eq('twilio_phone_number', normalized)
       .eq('is_active', true)
       .single()
       .then(({ data, error }) => {
         va = data;
-        console.log(`[loadAssistant] resultado: ${JSON.stringify(data)} error: ${error?.message}`);
+        console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} error: ${error?.message ?? 'none'}`);
       });
   }
 
@@ -104,7 +109,7 @@ wss.on('connection', (twilioWs, req) => {
       const params = msg.start?.customParameters ?? {};
       if (params.callSid) resolvedCallSid = params.callSid;
       if (params.phone) {
-        resolvedPhone = decodeURIComponent(params.phone).replace(/\s/g, '+');
+        resolvedPhone = normalizePhone(params.phone);
       }
       console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} phone="${resolvedPhone}"`);
 
