@@ -22,7 +22,7 @@ wss.on('connection', (twilioWs, req) => {
 
   const url = new URL(req.url, 'http://localhost');
   const callSid = url.searchParams.get('call_sid') ?? '';
-  const phoneParam = decodeURIComponent(url.searchParams.get('phone') ?? '').replace(/\s/g, '+');
+  const phoneParam = normalizePhone(url.searchParams.get('phone') ?? '');
 
   console.log(`[voice-stream] callSid=${callSid} phone=${phoneParam}`);
 
@@ -38,16 +38,15 @@ wss.on('connection', (twilioWs, req) => {
   let resolvedPhone = phoneParam;
 
   function normalizePhone(phone) {
-    return phone.replace(/%2B/gi, '+').replace(/%20/gi, '').replace(/\s/g, '');
+    return decodeURIComponent(phone).replace(/\s/g, '').replace(/\+/g, '+');
   }
 
   function loadAssistant(phone) {
-    const normalized = normalizePhone(phone);
-    console.log(`[loadAssistant] buscando phone="${normalized}"`);
+    console.log(`[loadAssistant] buscando phone="${phone}"`);
     return supabase
       .from('voice_assistants')
       .select('*, assistants(id, name, prompt, llm_model)')
-      .eq('twilio_phone_number', normalized)
+      .eq('twilio_phone_number', phone)
       .eq('is_active', true)
       .single()
       .then(({ data, error }) => {
@@ -108,10 +107,15 @@ wss.on('connection', (twilioWs, req) => {
       streamSid = msg.start?.streamSid ?? '';
       const params = msg.start?.customParameters ?? {};
       if (params.callSid) resolvedCallSid = params.callSid;
+
+      // Tomar phone de customParameters o del URL como fallback
       if (params.phone) {
         resolvedPhone = normalizePhone(params.phone);
+      } else if (resolvedPhone === '') {
+        resolvedPhone = normalizePhone(url.searchParams.get('phone') ?? '');
       }
-      console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} phone="${resolvedPhone}"`);
+
+      console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} phone="${resolvedPhone}" params=${JSON.stringify(params)}`);
 
       loadAssistant(resolvedPhone).then(() => {
         setTimeout(async () => {
