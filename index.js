@@ -38,19 +38,17 @@ wss.on('connection', (twilioWs, req) => {
   let resolvedPhone = phoneParam;
 
   function loadAssistant(phone) {
-    supabase
+    return supabase
       .from('voice_assistants')
       .select('*, assistants(id, name, prompt, llm_model)')
       .eq('twilio_phone_number', phone)
       .eq('is_active', true)
       .single()
-      .then(({ data }) => {
+      .then(({ data, error }) => {
         va = data;
-        console.log(`[voice-stream] Asistente: ${va?.assistants?.name}`);
+        console.log(`[voice-stream] Asistente: ${va?.assistants?.name} error: ${error?.message}`);
       });
   }
-
-  if (resolvedPhone) loadAssistant(resolvedPhone);
 
   function connectDeepgram() {
     const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
@@ -106,18 +104,21 @@ wss.on('connection', (twilioWs, req) => {
       if (params.callSid) resolvedCallSid = params.callSid;
       if (params.phone) {
         resolvedPhone = decodeURIComponent(params.phone).replace(/\s/g, '+');
-        if (!va) loadAssistant(resolvedPhone);
       }
       console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} phone=${resolvedPhone}`);
 
-      setTimeout(async () => {
-        if (va) {
-          const name = va.assistants?.name ?? 'Asistente';
-          isSpeaking = true;
-          await streamElevenLabsToTwilio(`Hola, soy ${name}. ¿En qué puedo ayudarte?`, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs);
-          isSpeaking = false;
-        }
-      }, 500);
+      loadAssistant(resolvedPhone).then(() => {
+        setTimeout(async () => {
+          if (va) {
+            const name = va.assistants?.name ?? 'Asistente';
+            isSpeaking = true;
+            await streamElevenLabsToTwilio(`Hola, soy ${name}. ¿En qué puedo ayudarte?`, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs);
+            isSpeaking = false;
+          } else {
+            console.error('[voice-stream] va sigue null después de cargar');
+          }
+        }, 300);
+      });
     }
 
     if (msg.event === 'media') {
