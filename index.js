@@ -1,3 +1,4 @@
+require("dotenv").config();
 const http = require('http');
 const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
@@ -21,7 +22,7 @@ wss.on('connection', (twilioWs, req) => {
 
   const url = new URL(req.url, 'http://localhost');
   const callSid = url.searchParams.get('call_sid') ?? '';
-  const phoneParam = decodeURIComponent(url.searchParams.get('phone') ?? '');
+  const phoneParam = decodeURIComponent(url.searchParams.get('phone') ?? '').replace(/\s/g, '+');
 
   console.log(`[voice-stream] callSid=${callSid} phone=${phoneParam}`);
 
@@ -104,7 +105,7 @@ wss.on('connection', (twilioWs, req) => {
       const params = msg.start?.customParameters ?? {};
       if (params.callSid) resolvedCallSid = params.callSid;
       if (params.phone) {
-        resolvedPhone = params.phone;
+        resolvedPhone = decodeURIComponent(params.phone).replace(/\s/g, '+');
         if (!va) loadAssistant(resolvedPhone);
       }
       console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} phone=${resolvedPhone}`);
