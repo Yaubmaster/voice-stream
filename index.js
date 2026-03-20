@@ -1,3 +1,6 @@
+
+Copiar
+
 require("dotenv").config();
 const http = require('http');
 const WebSocket = require('ws');
@@ -32,12 +35,17 @@ wss.on('connection', (twilioWs, req) => {
   let deepgramWs = null;
   let isDeepgramReady = false;
   let audioBuffer = [];
-  let isSpeaking = false;
   let va = null;
   let resolvedCallSid = callSid;
   let resolvedPhone = phoneParam;
   let currentAbortController = null;
-
+ 
+  // isSpeaking = true desde que empieza el TTS
+  // se pone false SOLO cuando Twilio manda el mark de confirmación
+  // Así el barge-in siempre tiene una ventana para dispararse
+  let isSpeaking = false;
+  let pendingMark = false;
+ 
   function normalizePhone(phone) {
     return decodeURIComponent(phone).replace(/\s/g, '').replace(/\+/g, '+');
   }
@@ -54,6 +62,7 @@ wss.on('connection', (twilioWs, req) => {
       currentAbortController = null;
     }
     isSpeaking = false;
+    pendingMark = false;
   }
  
   function loadAssistant(phone) {
@@ -70,6 +79,78 @@ wss.on('connection', (twilioWs, req) => {
       });
   }
  
+  // Pipeline completo: OpenAI + ElevenLabs, dentro del scope de la conexión
+  // para tener acceso a isSpeaking y pendingMark
+  async function runPipeline(transcript, signal) {
+    try {
+      if (!va) { console.error('[pipeline] va es null'); return; }
+      if (signal?.aborted) return;
+ 
+      const { data: call } = await supabase
+        .from('voice_calls')
+        .select('transcript, turn_count')
+        .eq('call_sid', resolvedCallSid)
+        .single();
+ 
+      const history = call?.transcript ?? [];
+      const turnCount = (call?.turn_count ?? 0) + 1;
+      const historyMessages = history.map(t => ({
+        role: t.role === 'user' ? 'user' : 'assistant',
+        content: t.text,
+      }));
+ 
+      if (signal?.aborted) return;
+ 
+      const aiReply = await callOpenAI(
+        va.assistants?.prompt ?? 'Eres un asistente útil.',
+        va.assistants?.llm_model ?? 'gpt-4o-mini',
+        transcript,
+        historyMessages,
+        signal
+      );
+ 
+      if (!aiReply || signal?.aborted) return;
+ 
+      console.log(`[AI] "${aiReply}"`);
+ 
+      history.push(
+        { role: 'user', text: transcript, ts: new Date().toISOString() },
+        { role: 'assistant', text: aiReply, ts: new Date().toISOString() }
+      );
+ 
+      supabase.from('voice_calls').update({
+        transcript: history,
+        turn_count: turnCount,
+        last_activity_at: new Date().toISOString(),
+      }).eq('call_sid', resolvedCallSid).then(() => {});
+ 
+      if (signal?.aborted) return;
+ 
+      // Marcar pendingMark ANTES de enviar el audio
+      pendingMark = true;
+ 
+      await streamElevenLabsToTwilio(
+        aiReply,
+        va.elevenlabs_voice_id,
+        va.elevenlabs_model,
+        streamSid,
+        twilioWs,
+        signal
+      );
+ 
+      // Si el signal fue abortado durante TTS, limpiar pendingMark
+      if (signal?.aborted) {
+        pendingMark = false;
+      }
+ 
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        console.error('[pipeline] Error:', err.message);
+      }
+      pendingMark = false;
+    }
+  }
+ 
   function connectDeepgram() {
     const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
       model: 'nova-2',
@@ -77,7 +158,7 @@ wss.on('connection', (twilioWs, req) => {
       encoding: 'mulaw',
       sample_rate: '8000',
       channels: '1',
-      interim_results: 'true',   // ← clave para barge-in en tiempo real
+      interim_results: 'true',
       endpointing: '200',
     }).toString();
  
@@ -98,49 +179,40 @@ wss.on('connection', (twilioWs, req) => {
       const msg = JSON.parse(data.toString());
       const transcript = msg?.channel?.alternatives?.[0]?.transcript ?? '';
       const isFinal = msg?.is_final === true;
-
+ 
       if (!transcript.trim()) return;
-
-      // ── INTERIM: usuario está hablando ahora mismo ────────────────────────
-      // Solo usamos el interim para disparar el barge-in, no para procesar
+ 
+      // ── INTERIM: usuario habla → cortar bot inmediato ─────────────────────
       if (!isFinal) {
         if (isSpeaking) {
           interruptSpeaking();
-          console.log('[barge-in] Interim transcript detectado — bot cortado');
+          console.log('[barge-in] Interim — bot cortado');
         }
-        return; // esperar transcript final para procesar
+        return;
       }
-
+ 
       // ── FINAL: procesar y responder ───────────────────────────────────────
       console.log(`[Deepgram] Transcript final: "${transcript}"`);
-
-      // Si llegó un final y el bot todavía habla (edge case), cortarlo también
+ 
       if (isSpeaking) {
         interruptSpeaking();
         await new Promise(r => setTimeout(r, 150));
       }
-
+ 
       isSpeaking = true;
       const controller = new AbortController();
       currentAbortController = controller;
  
       try {
-        await handleUserSpeech(
-          transcript,
-          resolvedCallSid,
-          va,
-          streamSid,
-          twilioWs,
-          supabase,
-          controller.signal
-        );
+        await runPipeline(transcript, controller.signal);
       } catch (err) {
         if (err.name !== 'AbortError') {
           console.error('[Deepgram handler] Error:', err.message);
         }
       } finally {
         if (currentAbortController === controller) currentAbortController = null;
-        isSpeaking = false;
+        // NO ponemos isSpeaking = false aquí
+        // Lo hace el handler del mark de Twilio
       }
     });
  
@@ -155,6 +227,15 @@ wss.on('connection', (twilioWs, req) => {
     try { msg = JSON.parse(data.toString()); } catch { return; }
  
     if (msg.event === 'connected') console.log('[Twilio] connected');
+ 
+    // ── MARK: Twilio confirma que el teléfono terminó de reproducir el audio ─
+    if (msg.event === 'mark') {
+      if (msg.mark?.name === 'end-of-response' && pendingMark) {
+        pendingMark = false;
+        isSpeaking = false;
+        console.log('[Twilio] Mark confirmado — bot terminó de hablar');
+      }
+    }
  
     if (msg.event === 'start') {
       streamSid = msg.start?.streamSid ?? '';
@@ -174,6 +255,7 @@ wss.on('connection', (twilioWs, req) => {
           if (va) {
             const name = va.assistants?.name ?? 'Asistente';
             isSpeaking = true;
+            pendingMark = true;
             await streamElevenLabsToTwilio(
               `Hola, soy ${name}. ¿En qué puedo ayudarte?`,
               va.elevenlabs_voice_id,
@@ -182,7 +264,7 @@ wss.on('connection', (twilioWs, req) => {
               twilioWs,
               null
             );
-            isSpeaking = false;
+            // isSpeaking se apaga cuando llega el mark
           } else {
             console.error('[voice-stream] va sigue null después de cargar');
           }
@@ -222,67 +304,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[voice-stream] Listening on port ${PORT}`);
 });
  
-// ─── handleUserSpeech ─────────────────────────────────────────────────────────
-async function handleUserSpeech(transcript, callSid, va, streamSid, twilioWs, supabase, signal) {
-  try {
-    if (!va) { console.error('[handleUserSpeech] va es null'); return; }
-    if (signal?.aborted) return;
- 
-    const { data: call } = await supabase
-      .from('voice_calls')
-      .select('transcript, turn_count')
-      .eq('call_sid', callSid)
-      .single();
- 
-    const history = call?.transcript ?? [];
-    const turnCount = (call?.turn_count ?? 0) + 1;
-    const historyMessages = history.map(t => ({
-      role: t.role === 'user' ? 'user' : 'assistant',
-      content: t.text,
-    }));
- 
-    if (signal?.aborted) return;
- 
-    const aiReply = await callOpenAI(
-      va.assistants?.prompt ?? 'Eres un asistente útil.',
-      va.assistants?.llm_model ?? 'gpt-4o-mini',
-      transcript,
-      historyMessages,
-      signal
-    );
- 
-    if (!aiReply || signal?.aborted) return;
- 
-    console.log(`[AI] "${aiReply}"`);
- 
-    history.push(
-      { role: 'user', text: transcript, ts: new Date().toISOString() },
-      { role: 'assistant', text: aiReply, ts: new Date().toISOString() }
-    );
- 
-    supabase.from('voice_calls').update({
-      transcript: history,
-      turn_count: turnCount,
-      last_activity_at: new Date().toISOString(),
-    }).eq('call_sid', callSid).then(() => {});
- 
-    if (signal?.aborted) return;
- 
-    await streamElevenLabsToTwilio(
-      aiReply,
-      va.elevenlabs_voice_id,
-      va.elevenlabs_model,
-      streamSid,
-      twilioWs,
-      signal
-    );
-  } catch (err) {
-    if (err.name !== 'AbortError') {
-      console.error('[handleUserSpeech] Error:', err.message);
-    }
-  }
-}
- 
 // ─── ElevenLabs TTS — streaming verdadero ────────────────────────────────────
 async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_5', streamSid, twilioWs, signal) {
   try {
@@ -307,7 +328,7 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
       console.error(`[ElevenLabs] Error ${res.status}:`, await res.text());
       return;
     }
-
+ 
     const reader = res.body.getReader();
     let leftover = Buffer.alloc(0);
     const chunkSize = 640;
@@ -317,9 +338,9 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
         if (signal?.aborted) { await reader.cancel(); return; }
         const { done, value } = await reader.read();
         if (done) break;
-
+ 
         leftover = Buffer.concat([leftover, Buffer.from(value)]);
-
+ 
         while (leftover.length >= chunkSize) {
           if (signal?.aborted) { await reader.cancel(); return; }
           const toSend = leftover.slice(0, chunkSize);
@@ -336,7 +357,7 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
     } finally {
       reader.releaseLock();
     }
-
+ 
     if (!signal?.aborted && leftover.length > 0 && twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.send(JSON.stringify({
         event: 'media',
