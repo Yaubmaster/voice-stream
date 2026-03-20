@@ -40,6 +40,7 @@ wss.on('connection', (twilioWs, req) => {
   let currentAbortController = null;
   let isSpeaking = false;
   let pendingMark = false;
+  const callStartTime = Date.now(); // ← para calcular duration_seconds
 
   function normalizePhone(phone) {
     return decodeURIComponent(phone).replace(/\s/g, '').replace(/\+/g, '+');
@@ -58,6 +59,18 @@ wss.on('connection', (twilioWs, req) => {
     }
     isSpeaking = false;
     pendingMark = false;
+  }
+
+  async function finalizeCall() {
+    const durationSeconds = Math.round((Date.now() - callStartTime) / 1000);
+    console.log(`[voice-stream] Finalizando llamada — duración: ${durationSeconds}s`);
+    if (resolvedCallSid) {
+      await supabase.from('voice_calls').update({
+        status: 'completed',
+        ended_at: new Date().toISOString(),
+        duration_seconds: durationSeconds,
+      }).eq('call_sid', resolvedCallSid);
+    }
   }
 
   function loadAssistant(phone) {
@@ -343,9 +356,6 @@ wss.on('connection', (twilioWs, req) => {
             return;
           }
 
-          // ── Saludo dinámico ────────────────────────────────────────────────
-          // Si el asistente tiene greeting configurado → lo dice al contestar (inbound)
-          // Si no tiene greeting → espera al usuario (outbound o sin saludo)
           const greeting = va.greeting;
           if (greeting) {
             console.log(`[voice-stream] Saludo: "${greeting}"`);
@@ -381,10 +391,7 @@ wss.on('connection', (twilioWs, req) => {
       console.log('[Twilio] stop');
       interruptSpeaking();
       deepgramWs?.close();
-      await supabase.from('voice_calls').update({
-        status: 'completed',
-        ended_at: new Date().toISOString(),
-      }).eq('call_sid', resolvedCallSid);
+      await finalizeCall();
     }
   });
 
@@ -393,6 +400,7 @@ wss.on('connection', (twilioWs, req) => {
     console.log('[Twilio WS] Cerrado');
     interruptSpeaking();
     deepgramWs?.close();
+    finalizeCall();
   });
 });
 
