@@ -19,15 +19,11 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 
-// ─── Trim texto para TTS — evita cambio de voz en respuestas largas ──────────
-// ElevenLabs cambia de timbre cuando el texto supera ~200 caracteres.
-// Cortamos en la última oración completa dentro del límite.
-function trimForTTS(text, maxChars = 180) {
+// ─── Trim texto para TTS ──────────────────────────────────────────────────────
+function trimForTTS(text, maxChars = 250) {
   if (!text || text.length <= maxChars) return text;
-  // Buscar el último punto antes del límite
   const cutoff = text.lastIndexOf('.', maxChars);
   if (cutoff > 60) return text.slice(0, cutoff + 1).trim();
-  // Si no hay punto, cortar en el último espacio
   const space = text.lastIndexOf(' ', maxChars);
   return space > 60 ? text.slice(0, space).trim() : text.slice(0, maxChars).trim();
 }
@@ -183,7 +179,7 @@ wss.on('connection', (twilioWs, req) => {
       const messages = [
         {
           role: 'system',
-          content: systemPrompt + '\n\nIMPORTANTE: Responde de forma CORTA y NATURAL para una llamada telefónica. Máximo 2-3 oraciones cortas. Sin listas ni bullets. Nunca más de 150 caracteres por respuesta.',
+          content: systemPrompt + '\n\nIMPORTANTE: Responde de forma CORTA y NATURAL para una llamada telefónica. Máximo 2-3 oraciones cortas. Sin listas ni bullets.',
         },
         ...historyMessages,
         { role: 'user', content: transcript },
@@ -194,8 +190,7 @@ wss.on('connection', (twilioWs, req) => {
 
       console.log(`[AI] "${aiReply}"`);
 
-      // Trim para TTS — evita cambio de voz y reduce costo de ElevenLabs
-      const ttsText = trimForTTS(aiReply, 180);
+      const ttsText = trimForTTS(aiReply, 250);
       if (ttsText !== aiReply) {
         console.log(`[TTS] Texto recortado de ${aiReply.length} a ${ttsText.length} chars`);
       }
@@ -381,7 +376,7 @@ wss.on('connection', (twilioWs, req) => {
             isSpeaking = true;
             pendingMark = true;
             await streamElevenLabsToTwilio(
-              trimForTTS(greeting, 180),
+              trimForTTS(greeting, 250),
               va.elevenlabs_voice_id,
               va.elevenlabs_model,
               streamSid,
