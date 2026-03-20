@@ -1,6 +1,3 @@
-
-Copiar
-
 require("dotenv").config();
 const http = require('http');
 const WebSocket = require('ws');
