@@ -10,7 +10,6 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Edge Function middleware URL
 const EXTERNAL_API_PROXY = `${SUPABASE_URL}/functions/v1/external-api-proxy`;
 
 const server = http.createServer((req, res) => {
@@ -75,7 +74,6 @@ wss.on('connection', (twilioWs, req) => {
       });
   }
 
-  // ── Llamar a la Edge Function proxy ────────────────────────────────────────
   async function callExternalTool(toolName, params) {
     console.log(`[function-calling] Llamando tool: ${toolName}`, params);
     try {
@@ -96,7 +94,6 @@ wss.on('connection', (twilioWs, req) => {
     }
   }
 
-  // ── OpenAI tools definition ─────────────────────────────────────────────────
   const OPENAI_TOOLS = [
     {
       type: 'function',
@@ -134,7 +131,6 @@ wss.on('connection', (twilioWs, req) => {
     },
   ];
 
-  // ── Pipeline completo con function calling ──────────────────────────────────
   async function runPipeline(transcript, signal) {
     try {
       if (!va) { console.error('[pipeline] va es null'); return; }
@@ -155,7 +151,6 @@ wss.on('connection', (twilioWs, req) => {
 
       if (signal?.aborted) return;
 
-      // ── OpenAI con tools ──────────────────────────────────────────────────
       const systemPrompt = va.assistants?.prompt ?? 'Eres un asistente útil.';
       const model = va.assistants?.llm_model ?? 'gpt-4o-mini';
 
@@ -168,7 +163,7 @@ wss.on('connection', (twilioWs, req) => {
         { role: 'user', content: transcript },
       ];
 
-      let aiReply = await callOpenAIWithTools(model, messages, OPENAI_TOOLS, signal);
+      const aiReply = await callOpenAIWithTools(model, messages, OPENAI_TOOLS, signal);
       if (!aiReply || signal?.aborted) return;
 
       console.log(`[AI] "${aiReply}"`);
@@ -187,15 +182,7 @@ wss.on('connection', (twilioWs, req) => {
       if (signal?.aborted) return;
 
       pendingMark = true;
-      await streamElevenLabsToTwilio(
-        aiReply,
-        va.elevenlabs_voice_id,
-        va.elevenlabs_model,
-        streamSid,
-        twilioWs,
-        signal
-      );
-
+      await streamElevenLabsToTwilio(aiReply, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs, signal);
       if (signal?.aborted) pendingMark = false;
 
     } catch (err) {
@@ -204,10 +191,8 @@ wss.on('connection', (twilioWs, req) => {
     }
   }
 
-  // ── OpenAI con function calling loop ───────────────────────────────────────
   async function callOpenAIWithTools(model, messages, tools, signal) {
     try {
-      // Loop para manejar múltiples tool calls en secuencia
       while (true) {
         if (signal?.aborted) return null;
 
@@ -233,29 +218,24 @@ wss.on('connection', (twilioWs, req) => {
 
         if (!msg) return 'Lo siento, ocurrió un error.';
 
-        // Sin tool calls → respuesta final de texto
         if (!msg.tool_calls || msg.tool_calls.length === 0) {
           return msg.content?.trim() ?? 'Lo siento, ocurrió un error.';
         }
 
-        // Hay tool calls → ejecutar cada una y continuar el loop
         console.log(`[function-calling] OpenAI solicitó ${msg.tool_calls.length} tool(s)`);
-        messages.push(msg); // agregar el mensaje del assistant con tool_calls
+        messages.push(msg);
 
         for (const toolCall of msg.tool_calls) {
           if (signal?.aborted) return null;
-
           const toolName = toolCall.function.name;
           const toolParams = JSON.parse(toolCall.function.arguments);
           const toolResult = await callExternalTool(toolName, toolParams);
-
           messages.push({
             role: 'tool',
             tool_call_id: toolCall.id,
             content: JSON.stringify(toolResult),
           });
         }
-        // Loop de nuevo con los resultados de las tools
       }
     } catch (err) {
       if (err.name === 'AbortError') return null;
@@ -358,12 +338,21 @@ wss.on('connection', (twilioWs, req) => {
 
       loadAssistant(resolvedPhone).then(() => {
         setTimeout(async () => {
-          if (va) {
-            const name = va.assistants?.name ?? 'Asistente';
+          if (!va) {
+            console.error('[voice-stream] va sigue null después de cargar');
+            return;
+          }
+
+          // ── Saludo dinámico ────────────────────────────────────────────────
+          // Si el asistente tiene greeting configurado → lo dice al contestar (inbound)
+          // Si no tiene greeting → espera al usuario (outbound o sin saludo)
+          const greeting = va.greeting;
+          if (greeting) {
+            console.log(`[voice-stream] Saludo: "${greeting}"`);
             isSpeaking = true;
             pendingMark = true;
             await streamElevenLabsToTwilio(
-              `Hola, gracias por llamar a KFC. Soy ${name}, ¿me podrías decir tu nombre por favor?`,
+              greeting,
               va.elevenlabs_voice_id,
               va.elevenlabs_model,
               streamSid,
@@ -371,7 +360,9 @@ wss.on('connection', (twilioWs, req) => {
               null
             );
           } else {
-            console.error('[voice-stream] va sigue null después de cargar');
+            console.log('[voice-stream] Sin greeting — esperando al usuario');
+            isSpeaking = false;
+            pendingMark = false;
           }
         }, 300);
       });
