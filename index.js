@@ -36,31 +36,23 @@ wss.on('connection', (twilioWs, req) => {
   let va = null;
   let resolvedCallSid = callSid;
   let resolvedPhone = phoneParam;
- 
-  // ── Barge-in state ──────────────────────────────────────────────────────────
   let currentAbortController = null;
- 
+
   function normalizePhone(phone) {
     return decodeURIComponent(phone).replace(/\s/g, '').replace(/\+/g, '+');
   }
  
-  // ── Cortar audio en curso y cancelar pipeline ──────────────────────────────
   function interruptSpeaking() {
     if (!isSpeaking && !currentAbortController) return;
     console.log('[barge-in] Usuario interrumpió — cancelando respuesta en curso');
- 
-    // 1. Vaciar buffer de audio en el teléfono
     if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
       console.log('[barge-in] Clear enviado a Twilio');
     }
- 
-    // 2. Abortar OpenAI + ElevenLabs fetch en vuelo
     if (currentAbortController) {
       currentAbortController.abort();
       currentAbortController = null;
     }
- 
     isSpeaking = false;
   }
  
@@ -85,8 +77,8 @@ wss.on('connection', (twilioWs, req) => {
       encoding: 'mulaw',
       sample_rate: '8000',
       channels: '1',
-      interim_results: 'false',
-      endpointing: '300',
+      interim_results: 'true',   // ← clave para barge-in en tiempo real
+      endpointing: '200',
     }).toString();
  
     deepgramWs = new WebSocket(dgUrl, {
@@ -106,19 +98,28 @@ wss.on('connection', (twilioWs, req) => {
       const msg = JSON.parse(data.toString());
       const transcript = msg?.channel?.alternatives?.[0]?.transcript ?? '';
       const isFinal = msg?.is_final === true;
- 
-      if (!isFinal || !transcript.trim()) return;
- 
-      console.log(`[Deepgram] Transcript: "${transcript}"`);
- 
-      // ── BARGE-IN: si el bot estaba hablando, cortarlo primero ─────────────
+
+      if (!transcript.trim()) return;
+
+      // ── INTERIM: usuario está hablando ahora mismo ────────────────────────
+      // Solo usamos el interim para disparar el barge-in, no para procesar
+      if (!isFinal) {
+        if (isSpeaking) {
+          interruptSpeaking();
+          console.log('[barge-in] Interim transcript detectado — bot cortado');
+        }
+        return; // esperar transcript final para procesar
+      }
+
+      // ── FINAL: procesar y responder ───────────────────────────────────────
+      console.log(`[Deepgram] Transcript final: "${transcript}"`);
+
+      // Si llegó un final y el bot todavía habla (edge case), cortarlo también
       if (isSpeaking) {
         interruptSpeaking();
-        // Pausa breve para que el clear llegue a Twilio antes de la nueva respuesta
         await new Promise(r => setTimeout(r, 150));
       }
- 
-      // ── Lanzar nuevo pipeline ─────────────────────────────────────────────
+
       isSpeaking = true;
       const controller = new AbortController();
       currentAbortController = controller;
@@ -259,7 +260,6 @@ async function handleUserSpeech(transcript, callSid, va, streamSid, twilioWs, su
       { role: 'assistant', text: aiReply, ts: new Date().toISOString() }
     );
  
-    // Guardar transcript sin bloquear la respuesta de voz
     supabase.from('voice_calls').update({
       transcript: history,
       turn_count: turnCount,
@@ -283,7 +283,7 @@ async function handleUserSpeech(transcript, callSid, va, streamSid, twilioWs, su
   }
 }
  
-// ─── ElevenLabs TTS — abortable ───────────────────────────────────────────────
+// ─── ElevenLabs TTS — streaming verdadero ────────────────────────────────────
 async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_5', streamSid, twilioWs, signal) {
   try {
     const res = await fetch(
@@ -307,36 +307,42 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
       console.error(`[ElevenLabs] Error ${res.status}:`, await res.text());
       return;
     }
- 
-    const chunks = [];
+
     const reader = res.body.getReader();
+    let leftover = Buffer.alloc(0);
+    const chunkSize = 640;
  
     try {
       while (true) {
         if (signal?.aborted) { await reader.cancel(); return; }
         const { done, value } = await reader.read();
         if (done) break;
-        chunks.push(value);
+
+        leftover = Buffer.concat([leftover, Buffer.from(value)]);
+
+        while (leftover.length >= chunkSize) {
+          if (signal?.aborted) { await reader.cancel(); return; }
+          const toSend = leftover.slice(0, chunkSize);
+          leftover = leftover.slice(chunkSize);
+          if (twilioWs.readyState === WebSocket.OPEN) {
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid,
+              media: { payload: toSend.toString('base64') },
+            }));
+          }
+        }
       }
     } finally {
       reader.releaseLock();
     }
- 
-    if (signal?.aborted) return;
- 
-    const audio = Buffer.concat(chunks.map(c => Buffer.from(c)));
-    const chunkSize = 640;
- 
-    for (let i = 0; i < audio.length; i += chunkSize) {
-      if (signal?.aborted) return;  // cortar envío si llegó barge-in durante el loop
-      const chunk = audio.slice(i, i + chunkSize);
-      if (twilioWs.readyState === WebSocket.OPEN) {
-        twilioWs.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: chunk.toString('base64') },
-        }));
-      }
+
+    if (!signal?.aborted && leftover.length > 0 && twilioWs.readyState === WebSocket.OPEN) {
+      twilioWs.send(JSON.stringify({
+        event: 'media',
+        streamSid,
+        media: { payload: leftover.toString('base64') },
+      }));
     }
  
     if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) {
