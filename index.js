@@ -67,40 +67,17 @@ function trimForTTS(text, maxChars = 250) {
   return space > 60 ? text.slice(0, space).trim() : text.slice(0, maxChars).trim();
 }
 
-// ─── Convertir MP3 → mulaw 8kHz (para OpenAI TTS) ────────────────────────────
+// ─── Convertir MP3 → mulaw 8kHz (funciona para OpenAI y Google) ──────────────
 function convertMp3ToMulaw(inputBuffer) {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', [
-      '-f', 'mp3', '-i', 'pipe:0',
-      '-ar', '8000', '-ac', '1',
-      '-acodec', 'pcm_mulaw', '-f', 'mulaw',
-      'pipe:1',
-    ]);
-    const chunks = [];
-    ffmpeg.stdout.on('data', chunk => chunks.push(chunk));
-    ffmpeg.stdout.on('end', () => resolve(Buffer.concat(chunks)));
-    ffmpeg.stderr.on('data', () => {});
-    ffmpeg.on('error', reject);
-    ffmpeg.stdin.write(inputBuffer);
-    ffmpeg.stdin.end();
-  });
-}
-
-// ─── Convertir LINEAR16 16kHz → mulaw 8kHz (para Google TTS) ─────────────────
-// CRÍTICO: el audio de Google viene en LINEAR16 a 16000 Hz
-// Hay que especificar -ar 16000 ANTES del -i para que ffmpeg sepa el rate de entrada
-function convertLinear16ToMulaw(inputBuffer) {
-  return new Promise((resolve, reject) => {
-    const ffmpeg = spawn('ffmpeg', [
-      '-f', 's16le',     // formato signed 16-bit little-endian
-      '-ar', '16000',    // sample rate de ENTRADA (Google devuelve 16kHz)
-      '-ac', '1',        // mono
-      '-i', 'pipe:0',    // input desde stdin
-      '-ar', '8000',     // sample rate de SALIDA (Twilio necesita 8kHz)
+      '-f', 'mp3',
+      '-i', 'pipe:0',
+      '-ar', '8000',
       '-ac', '1',
       '-acodec', 'pcm_mulaw',
       '-f', 'mulaw',
-      'pipe:1',          // output a stdout
+      'pipe:1',
     ]);
     const chunks = [];
     ffmpeg.stdout.on('data', chunk => chunks.push(chunk));
@@ -454,10 +431,8 @@ async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', s
     if (!res.ok) { console.error(`[OpenAI TTS] Error ${res.status}:`, await res.text()); return; }
     if (signal?.aborted) return;
     const mp3Buffer = Buffer.from(await res.arrayBuffer());
-    console.log(`[OpenAI TTS] MP3: ${mp3Buffer.length} bytes`);
     if (signal?.aborted) return;
     const mulawBuffer = await convertMp3ToMulaw(mp3Buffer);
-    console.log(`[OpenAI TTS] mulaw: ${mulawBuffer.length} bytes`);
     if (signal?.aborted) return;
     const chunkSize = 640;
     for (let i = 0; i < mulawBuffer.length; i += chunkSize) {
@@ -472,9 +447,9 @@ async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', s
   }
 }
 
-// ─── Google WaveNet TTS ───────────────────────────────────────────────────────
-// Google devuelve LINEAR16 a 16000Hz. ffmpeg DEBE saber el sample rate de entrada
-// para no interpretar el audio a velocidad incorrecta (efecto "ardilla").
+// ─── Google WaveNet TTS — usa MP3 para evitar problemas de sample rate ────────
+// Pedimos MP3 a Google (igual que OpenAI) y convertimos con el mismo ffmpeg pipeline
+// que ya funciona. Esto evita el problema de ardilla con LINEAR16.
 async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', languageCode = 'es-US', streamSid, twilioWs, signal) {
   try {
     console.log(`[Google TTS] voz=${voice} idioma=${languageCode}`);
@@ -488,8 +463,7 @@ async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', language
         input: { text },
         voice: { languageCode, name: voice },
         audioConfig: {
-          audioEncoding: 'LINEAR16',
-          sampleRateHertz: 16000,
+          audioEncoding: 'MP3',  // MP3 en lugar de LINEAR16 — ffmpeg lo maneja igual que OpenAI
           speakingRate: 1.0,
         },
       }),
@@ -500,12 +474,12 @@ async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', language
     if (signal?.aborted) return;
 
     const data = await res.json();
-    const rawBuffer = Buffer.from(data.audioContent, 'base64');
-    console.log(`[Google TTS] LINEAR16 raw: ${rawBuffer.length} bytes`);
+    const mp3Buffer = Buffer.from(data.audioContent, 'base64');
+    console.log(`[Google TTS] MP3: ${mp3Buffer.length} bytes`);
     if (signal?.aborted) return;
 
-    // Convertir LINEAR16 16kHz → mulaw 8kHz con sample rate correcto en entrada
-    const mulawBuffer = await convertLinear16ToMulaw(rawBuffer);
+    // Reusar el mismo pipeline de conversión que funciona con OpenAI
+    const mulawBuffer = await convertMp3ToMulaw(mp3Buffer);
     console.log(`[Google TTS] mulaw: ${mulawBuffer.length} bytes`);
     if (signal?.aborted) return;
 
