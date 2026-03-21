@@ -20,9 +20,7 @@ let googleAccessToken = null;
 let googleTokenExpiry = 0;
 
 async function getGoogleAccessToken() {
-  if (googleAccessToken && Date.now() < googleTokenExpiry - 60000) {
-    return googleAccessToken;
-  }
+  if (googleAccessToken && Date.now() < googleTokenExpiry - 60000) return googleAccessToken;
   const keyFile = JSON.parse(fs.readFileSync(GOOGLE_TTS_KEY_PATH, 'utf8'));
   const now = Math.floor(Date.now() / 1000);
   const payload = {
@@ -69,17 +67,40 @@ function trimForTTS(text, maxChars = 250) {
   return space > 60 ? text.slice(0, space).trim() : text.slice(0, maxChars).trim();
 }
 
-// ─── Convertir audio → mulaw 8kHz usando ffmpeg ───────────────────────────────
-function convertToMulaw(inputBuffer, inputFormat = 'mp3') {
+// ─── Convertir MP3 → mulaw 8kHz (para OpenAI TTS) ────────────────────────────
+function convertMp3ToMulaw(inputBuffer) {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', [
-      '-f', inputFormat,
-      '-i', 'pipe:0',
-      '-ar', '8000',
+      '-f', 'mp3', '-i', 'pipe:0',
+      '-ar', '8000', '-ac', '1',
+      '-acodec', 'pcm_mulaw', '-f', 'mulaw',
+      'pipe:1',
+    ]);
+    const chunks = [];
+    ffmpeg.stdout.on('data', chunk => chunks.push(chunk));
+    ffmpeg.stdout.on('end', () => resolve(Buffer.concat(chunks)));
+    ffmpeg.stderr.on('data', () => {});
+    ffmpeg.on('error', reject);
+    ffmpeg.stdin.write(inputBuffer);
+    ffmpeg.stdin.end();
+  });
+}
+
+// ─── Convertir LINEAR16 16kHz → mulaw 8kHz (para Google TTS) ─────────────────
+// CRÍTICO: el audio de Google viene en LINEAR16 a 16000 Hz
+// Hay que especificar -ar 16000 ANTES del -i para que ffmpeg sepa el rate de entrada
+function convertLinear16ToMulaw(inputBuffer) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', [
+      '-f', 's16le',     // formato signed 16-bit little-endian
+      '-ar', '16000',    // sample rate de ENTRADA (Google devuelve 16kHz)
+      '-ac', '1',        // mono
+      '-i', 'pipe:0',    // input desde stdin
+      '-ar', '8000',     // sample rate de SALIDA (Twilio necesita 8kHz)
       '-ac', '1',
       '-acodec', 'pcm_mulaw',
       '-f', 'mulaw',
-      'pipe:1',
+      'pipe:1',          // output a stdout
     ]);
     const chunks = [];
     ffmpeg.stdout.on('data', chunk => chunks.push(chunk));
@@ -236,7 +257,9 @@ wss.on('connection', (twilioWs, req) => {
         { role: 'user', text: transcript, ts: new Date().toISOString() },
         { role: 'assistant', text: aiReply, ts: new Date().toISOString() }
       );
-      supabase.from('voice_calls').update({ transcript: history, turn_count: turnCount, last_activity_at: new Date().toISOString() }).eq('call_sid', resolvedCallSid).then(() => {});
+      supabase.from('voice_calls').update({
+        transcript: history, turn_count: turnCount, last_activity_at: new Date().toISOString()
+      }).eq('call_sid', resolvedCallSid).then(() => {});
 
       if (signal?.aborted) return;
       pendingMark = true;
@@ -433,15 +456,14 @@ async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', s
     const mp3Buffer = Buffer.from(await res.arrayBuffer());
     console.log(`[OpenAI TTS] MP3: ${mp3Buffer.length} bytes`);
     if (signal?.aborted) return;
-    const mulawBuffer = await convertToMulaw(mp3Buffer, 'mp3');
+    const mulawBuffer = await convertMp3ToMulaw(mp3Buffer);
     console.log(`[OpenAI TTS] mulaw: ${mulawBuffer.length} bytes`);
     if (signal?.aborted) return;
     const chunkSize = 640;
     for (let i = 0; i < mulawBuffer.length; i += chunkSize) {
       if (signal?.aborted) return;
-      const chunk = mulawBuffer.slice(i, i + chunkSize);
       if (twilioWs.readyState === WebSocket.OPEN)
-        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
+        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mulawBuffer.slice(i, i + chunkSize).toString('base64') } }));
     }
     if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN)
       twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
@@ -450,12 +472,15 @@ async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', s
   }
 }
 
-// ─── Google WaveNet TTS — LINEAR16 via ffmpeg → mulaw ────────────────────────
+// ─── Google WaveNet TTS ───────────────────────────────────────────────────────
+// Google devuelve LINEAR16 a 16000Hz. ffmpeg DEBE saber el sample rate de entrada
+// para no interpretar el audio a velocidad incorrecta (efecto "ardilla").
 async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', languageCode = 'es-US', streamSid, twilioWs, signal) {
   try {
     console.log(`[Google TTS] voz=${voice} idioma=${languageCode}`);
     const accessToken = await getGoogleAccessToken();
     if (signal?.aborted) return;
+
     const res = await fetch('https://texttospeech.googleapis.com/v1/text:synthesize', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -465,26 +490,30 @@ async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', language
         audioConfig: {
           audioEncoding: 'LINEAR16',
           sampleRateHertz: 16000,
-          speakingRate: 0.85,  // Velocidad natural para llamadas telefónicas
+          speakingRate: 1.0,
         },
       }),
       signal,
     });
+
     if (!res.ok) { console.error(`[Google TTS] Error ${res.status}:`, await res.text()); return; }
     if (signal?.aborted) return;
+
     const data = await res.json();
-    const audioBuffer = Buffer.from(data.audioContent, 'base64');
-    console.log(`[Google TTS] LINEAR16: ${audioBuffer.length} bytes`);
+    const rawBuffer = Buffer.from(data.audioContent, 'base64');
+    console.log(`[Google TTS] LINEAR16 raw: ${rawBuffer.length} bytes`);
     if (signal?.aborted) return;
-    const mulawBuffer = await convertToMulaw(audioBuffer, 's16le');
+
+    // Convertir LINEAR16 16kHz → mulaw 8kHz con sample rate correcto en entrada
+    const mulawBuffer = await convertLinear16ToMulaw(rawBuffer);
     console.log(`[Google TTS] mulaw: ${mulawBuffer.length} bytes`);
     if (signal?.aborted) return;
+
     const chunkSize = 640;
     for (let i = 0; i < mulawBuffer.length; i += chunkSize) {
       if (signal?.aborted) return;
-      const chunk = mulawBuffer.slice(i, i + chunkSize);
       if (twilioWs.readyState === WebSocket.OPEN)
-        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
+        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mulawBuffer.slice(i, i + chunkSize).toString('base64') } }));
     }
     if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN)
       twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
