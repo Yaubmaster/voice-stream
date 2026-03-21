@@ -127,6 +127,7 @@ wss.on('connection', (twilioWs, req) => {
   let katuzSessionId = null;
   let katuzEnabled = false;
   let katuzTurnCount = 0;
+  let katuzTenantId = null;
 
   async function katuzCreateSession(voiceCallId, tenantId, assistantId) {
     try {
@@ -142,7 +143,8 @@ wss.on('connection', (twilioWs, req) => {
       if (error) { console.error('[Katuz] Error creando sesión:', error.message); return; }
       katuzSessionId = data.id;
       katuzEnabled = true;
-      console.log(`[Katuz] Sesión creada: ${katuzSessionId}`);
+      katuzTenantId = tenantId;
+      console.log(`[Katuz] Sesión creada: ${katuzSessionId} tenant: ${tenantId}`);
     } catch (err) {
       console.error('[Katuz] katuzCreateSession error:', err.message);
     }
@@ -153,7 +155,7 @@ wss.on('connection', (twilioWs, req) => {
     try {
       await supabase.from('katuz_events').insert({
         session_id: katuzSessionId,
-        tenant_id: va?.tenant_id,
+        tenant_id: katuzTenantId,
         event_type: 'transcript',
         speaker,
         content: text,
@@ -167,7 +169,6 @@ wss.on('connection', (twilioWs, req) => {
 
   async function katuzAnalyze(speaker, text) {
     if (!katuzEnabled || !katuzSessionId) return;
-    // Fire-and-forget — no bloqueamos el pipeline de voz
     fetch(KATUZ_ENGINE_URL, {
       method: 'POST',
       headers: {
@@ -176,7 +177,7 @@ wss.on('connection', (twilioWs, req) => {
       },
       body: JSON.stringify({
         session_id: katuzSessionId,
-        tenant_id: va?.tenant_id,
+        tenant_id: katuzTenantId,
         speaker,
         text,
         turn: katuzTurnCount,
@@ -229,7 +230,6 @@ wss.on('connection', (twilioWs, req) => {
         duration_seconds: durationSeconds,
       }).eq('call_sid', resolvedCallSid);
     }
-    // Cerrar sesión Katuz junto con la llamada
     await katuzFinalizeSession();
   }
 
@@ -237,7 +237,7 @@ wss.on('connection', (twilioWs, req) => {
     console.log(`[loadAssistant] buscando phone="${phone}"`);
     return supabase
       .from('voice_assistants')
-      .select('*, assistants(id, name, prompt, llm_model)')
+      .select('*, assistants(id, name, prompt, llm_model, tenant_id)')
       .eq('twilio_phone_number', phone)
       .eq('is_active', true)
       .single()
@@ -245,14 +245,14 @@ wss.on('connection', (twilioWs, req) => {
         va = data;
         console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} proveedor: ${va?.tts_provider ?? 'elevenlabs'} error: ${error?.message ?? 'none'}`);
 
-        // Iniciar sesión Katuz si el asistente tiene katuz_enabled
-        if (va?.katuz_enabled) {
+        // Iniciar sesión Katuz — tenant_id viene de assistants
+        if (va?.katuz_enabled && va?.assistants?.tenant_id) {
           supabase.from('voice_calls')
-            .select('id, tenant_id')
+            .select('id')
             .eq('call_sid', resolvedCallSid)
             .single()
             .then(({ data: callData }) => {
-              katuzCreateSession(callData?.id, va.tenant_id, va.assistants?.id);
+              katuzCreateSession(callData?.id, va.assistants.tenant_id, va.assistants.id);
             });
         }
       });
@@ -300,8 +300,6 @@ wss.on('connection', (twilioWs, req) => {
       if (signal?.aborted) return;
 
       katuzTurnCount++;
-
-      // Katuz: guardar transcript del cliente + disparar análisis (sin bloquear)
       katuzEmitTranscript('cliente', transcript);
       katuzAnalyze('cliente', transcript);
 
@@ -325,7 +323,6 @@ wss.on('connection', (twilioWs, req) => {
 
       console.log(`[AI] "${aiReply}"`);
 
-      // Katuz: guardar respuesta del asesor (bot) + análisis
       katuzEmitTranscript('asesor', aiReply);
       katuzAnalyze('asesor', aiReply);
 
