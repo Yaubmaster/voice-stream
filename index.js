@@ -3,6 +3,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 const { spawn } = require('child_process');
+const fs = require('fs');
 
 const PORT = process.env.PORT || 8080;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -10,8 +11,55 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const GOOGLE_TTS_KEY_PATH = process.env.GOOGLE_TTS_KEY_PATH;
 
 const EXTERNAL_API_PROXY = `${SUPABASE_URL}/functions/v1/external-api-proxy`;
+
+// ─── Google Auth token cache ──────────────────────────────────────────────────
+let googleAccessToken = null;
+let googleTokenExpiry = 0;
+
+async function getGoogleAccessToken() {
+  if (googleAccessToken && Date.now() < googleTokenExpiry - 60000) {
+    return googleAccessToken;
+  }
+
+  const keyFile = JSON.parse(fs.readFileSync(GOOGLE_TTS_KEY_PATH, 'utf8'));
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    iss: keyFile.client_email,
+    scope: 'https://www.googleapis.com/auth/cloud-platform',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now,
+  };
+
+  // Crear JWT firmado con la private key
+  const crypto = require('crypto');
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signingInput = `${header}.${body}`;
+  const sign = crypto.createSign('RSA-SHA256');
+  sign.update(signingInput);
+  const signature = sign.sign(keyFile.private_key, 'base64url');
+  const jwt = `${signingInput}.${signature}`;
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+  });
+
+  const data = await res.json();
+  if (!data.access_token) {
+    throw new Error(`Google auth failed: ${JSON.stringify(data)}`);
+  }
+
+  googleAccessToken = data.access_token;
+  googleTokenExpiry = Date.now() + (data.expires_in * 1000);
+  console.log('[Google TTS] Token renovado');
+  return googleAccessToken;
+}
 
 const server = http.createServer((req, res) => {
   res.writeHead(200);
@@ -30,23 +78,23 @@ function trimForTTS(text, maxChars = 250) {
 }
 
 // ─── Convertir buffer MP3 → mulaw 8kHz usando ffmpeg ─────────────────────────
-function convertMp3ToMulaw(mp3Buffer) {
+function convertToMulaw(inputBuffer, inputFormat = 'mp3') {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', [
-      '-i', 'pipe:0',          // input desde stdin
-      '-ar', '8000',           // sample rate 8kHz
-      '-ac', '1',              // mono
-      '-acodec', 'pcm_mulaw',  // codec mulaw
-      '-f', 'mulaw',           // formato mulaw raw
-      'pipe:1',                // output a stdout
+      '-f', inputFormat,
+      '-i', 'pipe:0',
+      '-ar', '8000',
+      '-ac', '1',
+      '-acodec', 'pcm_mulaw',
+      '-f', 'mulaw',
+      'pipe:1',
     ]);
-
     const chunks = [];
     ffmpeg.stdout.on('data', chunk => chunks.push(chunk));
     ffmpeg.stdout.on('end', () => resolve(Buffer.concat(chunks)));
-    ffmpeg.stderr.on('data', () => {}); // silenciar logs de ffmpeg
+    ffmpeg.stderr.on('data', () => {});
     ffmpeg.on('error', reject);
-    ffmpeg.stdin.write(mp3Buffer);
+    ffmpeg.stdin.write(inputBuffer);
     ffmpeg.stdin.end();
   });
 }
@@ -61,18 +109,21 @@ async function streamTTSToTwilio(text, va, streamSid, twilioWs, signal) {
       text,
       va.openai_voice ?? 'alloy',
       va.openai_tts_model ?? 'tts-1',
-      streamSid,
-      twilioWs,
-      signal
+      streamSid, twilioWs, signal
+    );
+  } else if (provider === 'google') {
+    await streamGoogleTTSToTwilio(
+      text,
+      va.google_tts_voice ?? 'es-US-Wavenet-B',
+      va.google_tts_language ?? 'es-US',
+      streamSid, twilioWs, signal
     );
   } else {
     await streamElevenLabsToTwilio(
       text,
       va.elevenlabs_voice_id,
       va.elevenlabs_model,
-      streamSid,
-      twilioWs,
-      signal
+      streamSid, twilioWs, signal
     );
   }
 }
@@ -174,10 +225,7 @@ wss.on('connection', (twilioWs, req) => {
         parameters: {
           type: 'object',
           properties: {
-            direccion: {
-              type: 'string',
-              description: 'Dirección completa del cliente, ej: "Calle Canarias 424, Portales Norte, Benito Juárez, CDMX"',
-            },
+            direccion: { type: 'string', description: 'Dirección completa del cliente' },
           },
           required: ['direccion'],
         },
@@ -191,10 +239,7 @@ wss.on('connection', (twilioWs, req) => {
         parameters: {
           type: 'object',
           properties: {
-            telefono: {
-              type: 'string',
-              description: 'Número de teléfono del cliente',
-            },
+            telefono: { type: 'string', description: 'Número de teléfono del cliente' },
           },
           required: ['telefono'],
         },
@@ -418,7 +463,6 @@ wss.on('connection', (twilioWs, req) => {
             console.error('[voice-stream] va sigue null después de cargar');
             return;
           }
-
           const greeting = va.greeting;
           if (greeting) {
             console.log(`[voice-stream] Saludo: "${greeting}"`);
@@ -512,7 +556,6 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
     if (!signal?.aborted && leftover.length > 0 && twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: leftover.toString('base64') } }));
     }
-
     if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
     }
@@ -521,64 +564,98 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
   }
 }
 
-// ─── OpenAI TTS — descarga MP3 y convierte a mulaw con ffmpeg ─────────────────
+// ─── OpenAI TTS — MP3 via ffmpeg → mulaw ─────────────────────────────────────
 async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', streamSid, twilioWs, signal) {
   try {
     console.log(`[OpenAI TTS] voz=${voice} modelo=${model}`);
-
     const res = await fetch('https://api.openai.com/v1/audio/speech', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${OPENAI_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model,
-        input: text,
-        voice,
-        response_format: 'mp3',
-        speed: 1.0,
-      }),
+      body: JSON.stringify({ model, input: text, voice, response_format: 'mp3', speed: 1.0 }),
       signal,
     });
 
-    if (!res.ok) {
-      console.error(`[OpenAI TTS] Error ${res.status}:`, await res.text());
-      return;
-    }
-
+    if (!res.ok) { console.error(`[OpenAI TTS] Error ${res.status}:`, await res.text()); return; }
     if (signal?.aborted) return;
 
-    // Descargar el MP3 completo
     const mp3Buffer = Buffer.from(await res.arrayBuffer());
-    console.log(`[OpenAI TTS] MP3 descargado: ${mp3Buffer.length} bytes`);
-
+    console.log(`[OpenAI TTS] MP3: ${mp3Buffer.length} bytes`);
     if (signal?.aborted) return;
 
-    // Convertir MP3 → mulaw 8kHz con ffmpeg
-    const mulawBuffer = await convertMp3ToMulaw(mp3Buffer);
-    console.log(`[OpenAI TTS] Convertido a mulaw: ${mulawBuffer.length} bytes`);
-
+    const mulawBuffer = await convertToMulaw(mp3Buffer, 'mp3');
+    console.log(`[OpenAI TTS] mulaw: ${mulawBuffer.length} bytes`);
     if (signal?.aborted) return;
 
-    // Enviar a Twilio en chunks de 640 bytes
     const chunkSize = 640;
     for (let i = 0; i < mulawBuffer.length; i += chunkSize) {
       if (signal?.aborted) return;
       const chunk = mulawBuffer.slice(i, i + chunkSize);
       if (twilioWs.readyState === WebSocket.OPEN) {
-        twilioWs.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: chunk.toString('base64') },
-        }));
+        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
       }
     }
-
     if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
     }
   } catch (err) {
-    if (err.name !== 'AbortError') console.error('[OpenAI TTS stream] Error:', err.message);
+    if (err.name !== 'AbortError') console.error('[OpenAI TTS] Error:', err.message);
+  }
+}
+
+// ─── Google WaveNet TTS — LINEAR16 via ffmpeg → mulaw ────────────────────────
+async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', languageCode = 'es-US', streamSid, twilioWs, signal) {
+  try {
+    console.log(`[Google TTS] voz=${voice} idioma=${languageCode}`);
+
+    const accessToken = await getGoogleAccessToken();
+    if (signal?.aborted) return;
+
+    const res = await fetch('https://texttospeech.googleapis.com/v1/text:synthesize', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        input: { text },
+        voice: { languageCode, name: voice },
+        audioConfig: {
+          audioEncoding: 'LINEAR16',
+          sampleRateHertz: 16000,
+          speakingRate: 1.0,
+        },
+      }),
+      signal,
+    });
+
+    if (!res.ok) { console.error(`[Google TTS] Error ${res.status}:`, await res.text()); return; }
+    if (signal?.aborted) return;
+
+    const data = await res.json();
+    const audioBuffer = Buffer.from(data.audioContent, 'base64');
+    console.log(`[Google TTS] LINEAR16: ${audioBuffer.length} bytes`);
+    if (signal?.aborted) return;
+
+    // Convertir LINEAR16 16kHz → mulaw 8kHz
+    const mulawBuffer = await convertToMulaw(audioBuffer, 's16le');
+    console.log(`[Google TTS] mulaw: ${mulawBuffer.length} bytes`);
+    if (signal?.aborted) return;
+
+    const chunkSize = 640;
+    for (let i = 0; i < mulawBuffer.length; i += chunkSize) {
+      if (signal?.aborted) return;
+      const chunk = mulawBuffer.slice(i, i + chunkSize);
+      if (twilioWs.readyState === WebSocket.OPEN) {
+        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
+      }
+    }
+    if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) {
+      twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') console.error('[Google TTS] Error:', err.message);
   }
 }
