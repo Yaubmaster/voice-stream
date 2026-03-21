@@ -28,6 +28,32 @@ function trimForTTS(text, maxChars = 250) {
   return space > 60 ? text.slice(0, space).trim() : text.slice(0, maxChars).trim();
 }
 
+// ─── Router TTS — decide qué proveedor usar ───────────────────────────────────
+async function streamTTSToTwilio(text, va, streamSid, twilioWs, signal) {
+  const provider = va.tts_provider ?? 'elevenlabs';
+  console.log(`[TTS] Proveedor: ${provider}`);
+
+  if (provider === 'openai') {
+    await streamOpenAITTSToTwilio(
+      text,
+      va.openai_voice ?? 'alloy',
+      va.openai_tts_model ?? 'tts-1',
+      streamSid,
+      twilioWs,
+      signal
+    );
+  } else {
+    await streamElevenLabsToTwilio(
+      text,
+      va.elevenlabs_voice_id,
+      va.elevenlabs_model,
+      streamSid,
+      twilioWs,
+      signal
+    );
+  }
+}
+
 wss.on('connection', (twilioWs, req) => {
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
 
@@ -92,7 +118,7 @@ wss.on('connection', (twilioWs, req) => {
       .single()
       .then(({ data, error }) => {
         va = data;
-        console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} error: ${error?.message ?? 'none'}`);
+        console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} proveedor: ${va?.tts_provider ?? 'elevenlabs'} error: ${error?.message ?? 'none'}`);
       });
   }
 
@@ -209,7 +235,7 @@ wss.on('connection', (twilioWs, req) => {
       if (signal?.aborted) return;
 
       pendingMark = true;
-      await streamElevenLabsToTwilio(ttsText, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs, signal);
+      await streamTTSToTwilio(ttsText, va, streamSid, twilioWs, signal);
       if (signal?.aborted) pendingMark = false;
 
     } catch (err) {
@@ -375,14 +401,7 @@ wss.on('connection', (twilioWs, req) => {
             console.log(`[voice-stream] Saludo: "${greeting}"`);
             isSpeaking = true;
             pendingMark = true;
-            await streamElevenLabsToTwilio(
-              trimForTTS(greeting, 250),
-              va.elevenlabs_voice_id,
-              va.elevenlabs_model,
-              streamSid,
-              twilioWs,
-              null
-            );
+            await streamTTSToTwilio(trimForTTS(greeting, 250), va, streamSid, twilioWs, null);
           } else {
             console.log('[voice-stream] Sin greeting — esperando al usuario');
             isSpeaking = false;
@@ -476,5 +495,70 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
     }
   } catch (err) {
     if (err.name !== 'AbortError') console.error('[ElevenLabs stream] Error:', err.message);
+  }
+}
+
+// ─── OpenAI TTS — streaming verdadero ────────────────────────────────────────
+async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', streamSid, twilioWs, signal) {
+  try {
+    console.log(`[OpenAI TTS] voz=${voice} modelo=${model} texto="${text.slice(0, 50)}..."`);
+
+    // OpenAI TTS devuelve mp3 — necesitamos convertir a mulaw 8000Hz para Twilio
+    // Usamos el endpoint con response_format=pcm que devuelve PCM 24kHz
+    // y lo convertimos a mulaw 8kHz manualmente
+    const res = await fetch('https://api.openai.com/v1/audio/speech', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        input: text,
+        voice,
+        response_format: 'ulaw',  // OpenAI soporta ulaw directamente
+        speed: 1.0,
+      }),
+      signal,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`[OpenAI TTS] Error ${res.status}:`, errText);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    let leftover = Buffer.alloc(0);
+    const chunkSize = 640;
+
+    try {
+      while (true) {
+        if (signal?.aborted) { await reader.cancel(); return; }
+        const { done, value } = await reader.read();
+        if (done) break;
+        leftover = Buffer.concat([leftover, Buffer.from(value)]);
+        while (leftover.length >= chunkSize) {
+          if (signal?.aborted) { await reader.cancel(); return; }
+          const toSend = leftover.slice(0, chunkSize);
+          leftover = leftover.slice(chunkSize);
+          if (twilioWs.readyState === WebSocket.OPEN) {
+            twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: toSend.toString('base64') } }));
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    if (!signal?.aborted && leftover.length > 0 && twilioWs.readyState === WebSocket.OPEN) {
+      twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: leftover.toString('base64') } }));
+    }
+
+    if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) {
+      twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') console.error('[OpenAI TTS stream] Error:', err.message);
   }
 }
