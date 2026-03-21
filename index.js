@@ -14,6 +14,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GOOGLE_TTS_KEY_PATH = process.env.GOOGLE_TTS_KEY_PATH;
 
 const EXTERNAL_API_PROXY = `${SUPABASE_URL}/functions/v1/external-api-proxy`;
+const KATUZ_ENGINE_URL = `${SUPABASE_URL}/functions/v1/katuz-engine`;
 
 // ─── Google Auth token cache ──────────────────────────────────────────────────
 let googleAccessToken = null;
@@ -67,7 +68,7 @@ function trimForTTS(text, maxChars = 250) {
   return space > 60 ? text.slice(0, space).trim() : text.slice(0, maxChars).trim();
 }
 
-// ─── Convertir MP3 → mulaw 8kHz (funciona para OpenAI y Google) ──────────────
+// ─── Convertir MP3 → mulaw 8kHz ──────────────────────────────────────────────
 function convertMp3ToMulaw(inputBuffer) {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', [
@@ -122,6 +123,83 @@ wss.on('connection', (twilioWs, req) => {
   let pendingMark = false;
   const callStartTime = Date.now();
 
+  // ─── KATUZ state ─────────────────────────────────────────────────────────
+  let katuzSessionId = null;
+  let katuzEnabled = false;
+  let katuzTurnCount = 0;
+
+  async function katuzCreateSession(voiceCallId, tenantId, assistantId) {
+    try {
+      const { data, error } = await supabase.from('katuz_sessions').insert({
+        call_sid: resolvedCallSid,
+        voice_call_id: voiceCallId ?? null,
+        tenant_id: tenantId,
+        assistant_id: assistantId ?? null,
+        phone_from: resolvedPhone,
+        status: 'active',
+        started_at: new Date().toISOString(),
+      }).select('id').single();
+      if (error) { console.error('[Katuz] Error creando sesión:', error.message); return; }
+      katuzSessionId = data.id;
+      katuzEnabled = true;
+      console.log(`[Katuz] Sesión creada: ${katuzSessionId}`);
+    } catch (err) {
+      console.error('[Katuz] katuzCreateSession error:', err.message);
+    }
+  }
+
+  async function katuzEmitTranscript(speaker, text) {
+    if (!katuzEnabled || !katuzSessionId) return;
+    try {
+      await supabase.from('katuz_events').insert({
+        session_id: katuzSessionId,
+        tenant_id: va?.tenant_id,
+        event_type: 'transcript',
+        speaker,
+        content: text,
+        ts_offset_ms: Date.now() - callStartTime,
+        metadata: {},
+      });
+    } catch (err) {
+      console.error('[Katuz] emit transcript error:', err.message);
+    }
+  }
+
+  async function katuzAnalyze(speaker, text) {
+    if (!katuzEnabled || !katuzSessionId) return;
+    // Fire-and-forget — no bloqueamos el pipeline de voz
+    fetch(KATUZ_ENGINE_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+      body: JSON.stringify({
+        session_id: katuzSessionId,
+        tenant_id: va?.tenant_id,
+        speaker,
+        text,
+        turn: katuzTurnCount,
+        ts_offset_ms: Date.now() - callStartTime,
+      }),
+    }).catch(err => console.error('[Katuz] analyze error:', err.message));
+  }
+
+  async function katuzFinalizeSession() {
+    if (!katuzEnabled || !katuzSessionId) return;
+    try {
+      await supabase.from('katuz_sessions').update({
+        status: 'completed',
+        ended_at: new Date().toISOString(),
+        duration_seconds: Math.round((Date.now() - callStartTime) / 1000),
+      }).eq('id', katuzSessionId);
+      console.log(`[Katuz] Sesión finalizada: ${katuzSessionId}`);
+    } catch (err) {
+      console.error('[Katuz] finalizeSession error:', err.message);
+    }
+  }
+  // ─── fin KATUZ state ──────────────────────────────────────────────────────
+
   function normalizePhone(phone) {
     return decodeURIComponent(phone).replace(/\s/g, '').replace(/\+/g, '+');
   }
@@ -151,6 +229,8 @@ wss.on('connection', (twilioWs, req) => {
         duration_seconds: durationSeconds,
       }).eq('call_sid', resolvedCallSid);
     }
+    // Cerrar sesión Katuz junto con la llamada
+    await katuzFinalizeSession();
   }
 
   function loadAssistant(phone) {
@@ -164,6 +244,17 @@ wss.on('connection', (twilioWs, req) => {
       .then(({ data, error }) => {
         va = data;
         console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} proveedor: ${va?.tts_provider ?? 'elevenlabs'} error: ${error?.message ?? 'none'}`);
+
+        // Iniciar sesión Katuz si el asistente tiene katuz_enabled
+        if (va?.katuz_enabled) {
+          supabase.from('voice_calls')
+            .select('id, tenant_id')
+            .eq('call_sid', resolvedCallSid)
+            .single()
+            .then(({ data: callData }) => {
+              katuzCreateSession(callData?.id, va.tenant_id, va.assistants?.id);
+            });
+        }
       });
   }
 
@@ -208,6 +299,12 @@ wss.on('connection', (twilioWs, req) => {
       if (!va) { console.error('[pipeline] va es null'); return; }
       if (signal?.aborted) return;
 
+      katuzTurnCount++;
+
+      // Katuz: guardar transcript del cliente + disparar análisis (sin bloquear)
+      katuzEmitTranscript('cliente', transcript);
+      katuzAnalyze('cliente', transcript);
+
       const { data: call } = await supabase.from('voice_calls').select('transcript, turn_count').eq('call_sid', resolvedCallSid).single();
       const history = call?.transcript ?? [];
       const turnCount = (call?.turn_count ?? 0) + 1;
@@ -227,6 +324,11 @@ wss.on('connection', (twilioWs, req) => {
       if (!aiReply || signal?.aborted) return;
 
       console.log(`[AI] "${aiReply}"`);
+
+      // Katuz: guardar respuesta del asesor (bot) + análisis
+      katuzEmitTranscript('asesor', aiReply);
+      katuzAnalyze('asesor', aiReply);
+
       const ttsText = trimForTTS(aiReply, 250);
       if (ttsText !== aiReply) console.log(`[TTS] Texto recortado de ${aiReply.length} a ${ttsText.length} chars`);
 
@@ -447,9 +549,7 @@ async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', s
   }
 }
 
-// ─── Google WaveNet TTS — usa MP3 para evitar problemas de sample rate ────────
-// Pedimos MP3 a Google (igual que OpenAI) y convertimos con el mismo ffmpeg pipeline
-// que ya funciona. Esto evita el problema de ardilla con LINEAR16.
+// ─── Google WaveNet TTS ───────────────────────────────────────────────────────
 async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', languageCode = 'es-US', streamSid, twilioWs, signal) {
   try {
     console.log(`[Google TTS] voz=${voice} idioma=${languageCode}`);
@@ -462,10 +562,7 @@ async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', language
       body: JSON.stringify({
         input: { text },
         voice: { languageCode, name: voice },
-        audioConfig: {
-          audioEncoding: 'MP3',  // MP3 en lugar de LINEAR16 — ffmpeg lo maneja igual que OpenAI
-          speakingRate: 1.0,
-        },
+        audioConfig: { audioEncoding: 'MP3', speakingRate: 1.0 },
       }),
       signal,
     });
@@ -478,7 +575,6 @@ async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', language
     console.log(`[Google TTS] MP3: ${mp3Buffer.length} bytes`);
     if (signal?.aborted) return;
 
-    // Reusar el mismo pipeline de conversión que funciona con OpenAI
     const mulawBuffer = await convertMp3ToMulaw(mp3Buffer);
     console.log(`[Google TTS] mulaw: ${mulawBuffer.length} bytes`);
     if (signal?.aborted) return;
