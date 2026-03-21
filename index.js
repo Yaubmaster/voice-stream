@@ -379,7 +379,7 @@ wss.on('connection', (twilioWs, req) => {
   function connectDeepgram() {
     const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
       model: 'nova-2', language: 'es', encoding: 'mulaw', sample_rate: '8000',
-      channels: '1', interim_results: 'true', endpointing: '200',
+      channels: '1', interim_results: 'true', endpointing: '400',
     }).toString();
     deepgramWs = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
     deepgramWs.on('open', () => {
