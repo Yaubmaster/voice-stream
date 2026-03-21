@@ -2,6 +2,7 @@ require("dotenv").config();
 const http = require('http');
 const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
+const { spawn } = require('child_process');
 
 const PORT = process.env.PORT || 8080;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -28,7 +29,29 @@ function trimForTTS(text, maxChars = 250) {
   return space > 60 ? text.slice(0, space).trim() : text.slice(0, maxChars).trim();
 }
 
-// ─── Router TTS — decide qué proveedor usar ───────────────────────────────────
+// ─── Convertir buffer MP3 → mulaw 8kHz usando ffmpeg ─────────────────────────
+function convertMp3ToMulaw(mp3Buffer) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', [
+      '-i', 'pipe:0',          // input desde stdin
+      '-ar', '8000',           // sample rate 8kHz
+      '-ac', '1',              // mono
+      '-acodec', 'pcm_mulaw',  // codec mulaw
+      '-f', 'mulaw',           // formato mulaw raw
+      'pipe:1',                // output a stdout
+    ]);
+
+    const chunks = [];
+    ffmpeg.stdout.on('data', chunk => chunks.push(chunk));
+    ffmpeg.stdout.on('end', () => resolve(Buffer.concat(chunks)));
+    ffmpeg.stderr.on('data', () => {}); // silenciar logs de ffmpeg
+    ffmpeg.on('error', reject);
+    ffmpeg.stdin.write(mp3Buffer);
+    ffmpeg.stdin.end();
+  });
+}
+
+// ─── Router TTS ───────────────────────────────────────────────────────────────
 async function streamTTSToTwilio(text, va, streamSid, twilioWs, signal) {
   const provider = va.tts_provider ?? 'elevenlabs';
   console.log(`[TTS] Proveedor: ${provider}`);
@@ -498,14 +521,11 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
   }
 }
 
-// ─── OpenAI TTS — streaming verdadero ────────────────────────────────────────
+// ─── OpenAI TTS — descarga MP3 y convierte a mulaw con ffmpeg ─────────────────
 async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', streamSid, twilioWs, signal) {
   try {
-    console.log(`[OpenAI TTS] voz=${voice} modelo=${model} texto="${text.slice(0, 50)}..."`);
+    console.log(`[OpenAI TTS] voz=${voice} modelo=${model}`);
 
-    // OpenAI TTS devuelve mp3 — necesitamos convertir a mulaw 8000Hz para Twilio
-    // Usamos el endpoint con response_format=pcm que devuelve PCM 24kHz
-    // y lo convertimos a mulaw 8kHz manualmente
     const res = await fetch('https://api.openai.com/v1/audio/speech', {
       method: 'POST',
       headers: {
@@ -516,43 +536,43 @@ async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', s
         model,
         input: text,
         voice,
-        response_format: 'ulaw',  // OpenAI soporta ulaw directamente
+        response_format: 'mp3',
         speed: 1.0,
       }),
       signal,
     });
 
     if (!res.ok) {
-      const errText = await res.text();
-      console.error(`[OpenAI TTS] Error ${res.status}:`, errText);
+      console.error(`[OpenAI TTS] Error ${res.status}:`, await res.text());
       return;
     }
 
-    const reader = res.body.getReader();
-    let leftover = Buffer.alloc(0);
+    if (signal?.aborted) return;
+
+    // Descargar el MP3 completo
+    const mp3Buffer = Buffer.from(await res.arrayBuffer());
+    console.log(`[OpenAI TTS] MP3 descargado: ${mp3Buffer.length} bytes`);
+
+    if (signal?.aborted) return;
+
+    // Convertir MP3 → mulaw 8kHz con ffmpeg
+    const mulawBuffer = await convertMp3ToMulaw(mp3Buffer);
+    console.log(`[OpenAI TTS] Convertido a mulaw: ${mulawBuffer.length} bytes`);
+
+    if (signal?.aborted) return;
+
+    // Enviar a Twilio en chunks de 640 bytes
     const chunkSize = 640;
-
-    try {
-      while (true) {
-        if (signal?.aborted) { await reader.cancel(); return; }
-        const { done, value } = await reader.read();
-        if (done) break;
-        leftover = Buffer.concat([leftover, Buffer.from(value)]);
-        while (leftover.length >= chunkSize) {
-          if (signal?.aborted) { await reader.cancel(); return; }
-          const toSend = leftover.slice(0, chunkSize);
-          leftover = leftover.slice(chunkSize);
-          if (twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: toSend.toString('base64') } }));
-          }
-        }
+    for (let i = 0; i < mulawBuffer.length; i += chunkSize) {
+      if (signal?.aborted) return;
+      const chunk = mulawBuffer.slice(i, i + chunkSize);
+      if (twilioWs.readyState === WebSocket.OPEN) {
+        twilioWs.send(JSON.stringify({
+          event: 'media',
+          streamSid,
+          media: { payload: chunk.toString('base64') },
+        }));
       }
-    } finally {
-      reader.releaseLock();
-    }
-
-    if (!signal?.aborted && leftover.length > 0 && twilioWs.readyState === WebSocket.OPEN) {
-      twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: leftover.toString('base64') } }));
     }
 
     if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) {
