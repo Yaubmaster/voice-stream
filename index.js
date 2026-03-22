@@ -104,12 +104,65 @@ async function callDynamicIntegration(integration, params) {
   }
 }
 
+// ─── Inferir outcome + variables custom al final de llamada ──────────────────
+async function inferCallOutcome(transcript, dashboardType, outcomeVariables) {
+  if (!transcript || transcript.length < 2) return { outcome: null, variables: {} };
+
+  const lastTurns = transcript.slice(-8).map(t => `${t.role}: ${t.text}`).join('\n');
+
+  const outcomeByType = {
+    ventas: '"completed" si se tomó un pedido o venta exitosa, "coverage_failed" si no hay cobertura, "abandoned" si el cliente colgó sin comprar, "escalated" si se transfirió',
+    cobranza: '"promise" si el cliente prometió pagar, "refused" si se negó, "wrong_contact" si no era la persona correcta, "callback" si pidió que lo llamen después, "abandoned" si colgó',
+    atencion: '"resolved" si se resolvió el problema, "escalated" si se transfirió a humano, "unresolved" si no se pudo resolver, "abandoned" si colgó sin resolver',
+  };
+
+  const outcomeOptions = outcomeByType[dashboardType ?? 'atencion'];
+
+  // Construir instrucciones para variables custom
+  let variableInstructions = '';
+  if (outcomeVariables && outcomeVariables.length > 0) {
+    variableInstructions = `\nTambién extrae estas variables de la conversación (null si no se mencionaron):\n` +
+      outcomeVariables.map(v => `- "${v.key}": ${v.description}`).join('\n');
+  }
+
+  const systemPrompt = `Analiza esta conversación de contact center.
+Responde SOLO con JSON válido sin markdown:
+{
+  "outcome": "<una de: ${outcomeOptions}>",
+  "outcome_reason": "frase corta explicando por qué"${outcomeVariables?.length > 0 ? `,
+  "variables": {${outcomeVariables?.map(v => `"${v.key}": null`).join(', ')}}` : ''}
+}${variableInstructions}`;
+
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        max_tokens: 200,
+        temperature: 0.1,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: lastTurns }
+        ]
+      })
+    });
+    const data = await res.json();
+    const raw = data.choices?.[0]?.message?.content?.trim() ?? '{}';
+    const parsed = JSON.parse(raw);
+    console.log(`[outcome] Detectado: ${parsed.outcome} — ${parsed.outcome_reason}`);
+    return { outcome: parsed.outcome, variables: parsed.variables ?? {}, reason: parsed.outcome_reason };
+  } catch (err) {
+    console.error('[outcome] Error infiriendo outcome:', err.message);
+    return { outcome: null, variables: {} };
+  }
+}
+
 wss.on('connection', (twilioWs, req) => {
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
   const url = new URL(req.url, 'http://localhost');
   const callSid = url.searchParams.get('call_sid') ?? '';
   const phoneParam = normalizePhone(url.searchParams.get('phone') ?? '');
-  // callerPhone = número de quien llama (From) — se actualiza en evento start
   let callerPhone = normalizePhone(url.searchParams.get('from') ?? '');
   console.log(`[voice-stream] callSid=${callSid} to=${phoneParam} from=${callerPhone}`);
 
@@ -125,7 +178,9 @@ wss.on('connection', (twilioWs, req) => {
   let isSpeaking = false;
   let pendingMark = false;
   const callStartTime = Date.now();
+  let callFinalized = false;
 
+  // ─── KATUZ state ──────────────────────────────────────────────────────────
   let katuzSessionId = null;
   let katuzEnabled = false;
   let katuzTurnCount = 0;
@@ -173,18 +228,63 @@ wss.on('connection', (twilioWs, req) => {
   }
 
   async function finalizeCall() {
+    if (callFinalized) return;
+    callFinalized = true;
     const durationSeconds = Math.round((Date.now() - callStartTime) / 1000);
     console.log(`[voice-stream] Finalizando llamada — duración: ${durationSeconds}s`);
-    if (resolvedCallSid) await supabase.from('voice_calls').update({ status: 'completed', ended_at: new Date().toISOString(), duration_seconds: durationSeconds }).eq('call_sid', resolvedCallSid);
+
+    try {
+      // Obtener transcript completo y datos del asistente para inferir outcome
+      const { data: callData } = await supabase.from('voice_calls').select('transcript').eq('call_sid', resolvedCallSid).single();
+      const transcript = callData?.transcript ?? [];
+
+      // Obtener dashboard_type y outcome_variables del asistente
+      const dashboardType = va?.assistants?.dashboard_type ?? 'atencion';
+      const outcomeVariables = va?.assistants?.outcome_variables ?? [];
+
+      // Inferir outcome con GPT
+      const { outcome, variables, reason } = await inferCallOutcome(transcript, dashboardType, outcomeVariables);
+
+      await supabase.from('voice_calls').update({
+        status: 'completed',
+        ended_at: new Date().toISOString(),
+        duration_seconds: durationSeconds,
+        outcome: outcome,
+        ...(Object.keys(variables).length > 0 ? { outcome_variables: variables } : {}),
+      }).eq('call_sid', resolvedCallSid);
+
+      console.log(`[voice-stream] Llamada finalizada — outcome: ${outcome} variables: ${JSON.stringify(variables)}`);
+    } catch (err) {
+      console.error('[finalizeCall] Error:', err.message);
+      await supabase.from('voice_calls').update({ status: 'completed', ended_at: new Date().toISOString(), duration_seconds: durationSeconds }).eq('call_sid', resolvedCallSid);
+    }
+
     await katuzFinalizeSession();
+  }
+
+  // ─── Hangup — colgar la llamada desde el bot ──────────────────────────────
+  function hangupCall() {
+    console.log('[voice-stream] Colgando llamada...');
+    if (twilioWs.readyState === WebSocket.OPEN) {
+      // Enviar TwiML para colgar via Twilio REST API
+      fetch(`https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls/${resolvedCallSid}.json`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Authorization': 'Basic ' + Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')
+        },
+        body: 'Status=completed'
+      }).then(() => console.log('[voice-stream] Llamada colgada via Twilio API'))
+        .catch(err => console.error('[voice-stream] Error colgando:', err.message));
+    }
   }
 
   function loadAssistant(phone) {
     console.log(`[loadAssistant] buscando phone="${phone}"`);
-    return supabase.from('voice_assistants').select('*, assistants(id, name, prompt, llm_model, tenant_id)').eq('twilio_phone_number', phone).eq('is_active', true).single()
+    return supabase.from('voice_assistants').select('*, assistants(id, name, prompt, llm_model, tenant_id, dashboard_type, outcome_variables)').eq('twilio_phone_number', phone).eq('is_active', true).single()
       .then(({ data, error }) => {
         va = data;
-        console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} proveedor: ${va?.tts_provider ?? 'elevenlabs'} integraciones: ${va?.integrations?.length ?? 0} error: ${error?.message ?? 'none'}`);
+        console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} tipo: ${va?.assistants?.dashboard_type ?? 'atencion'} integraciones: ${va?.integrations?.length ?? 0} error: ${error?.message ?? 'none'}`);
         if (va?.katuz_enabled && va?.assistants?.tenant_id) {
           supabase.from('voice_calls').select('id').eq('call_sid', resolvedCallSid).single()
             .then(({ data: callData }) => { katuzCreateSession(callData?.id, va.assistants.tenant_id, va.assistants.id); });
@@ -208,7 +308,6 @@ wss.on('connection', (twilioWs, req) => {
 
       if (signal?.aborted) return;
 
-      // {{phone}} = número del cliente (From), {{call_sid}} = CallSid
       const rawPrompt = va.assistants?.prompt ?? 'Eres un asistente útil.';
       const systemPrompt = rawPrompt
         .replace(/\{\{phone\}\}/g, callerPhone || 'desconocido')
@@ -220,7 +319,7 @@ wss.on('connection', (twilioWs, req) => {
       console.log(`[pipeline] caller=${callerPhone} tools: ${dynamicTools.map(t => t.function.name).join(', ') || 'ninguna'}`);
 
       const messages = [
-        { role: 'system', content: systemPrompt + '\n\nIMPORTANTE: Responde de forma CORTA y NATURAL para una llamada telefónica. Máximo 2-3 oraciones cortas. Sin listas ni bullets.' },
+        { role: 'system', content: systemPrompt + '\n\nIMPORTANTE: Responde de forma CORTA y NATURAL para una llamada telefónica. Máximo 2-3 oraciones cortas. Sin listas ni bullets.\n\nCuando la conversación haya terminado (el cliente se despidió, completó su objetivo o indicó que no necesita más ayuda), incluye la frase exacta: [HANGUP] al final de tu respuesta.' },
         ...historyMessages,
         { role: 'user', content: transcript },
       ];
@@ -228,20 +327,32 @@ wss.on('connection', (twilioWs, req) => {
       const aiReply = await callOpenAIWithDynamicTools(model, messages, dynamicTools, integrations, signal);
       if (!aiReply || signal?.aborted) return;
 
-      console.log(`[AI] "${aiReply}"`);
-      katuzEmitTranscript('asesor', aiReply);
-      katuzAnalyze('asesor', aiReply);
+      // Detectar si el bot debe colgar
+      const shouldHangup = aiReply.includes('[HANGUP]');
+      const cleanReply = aiReply.replace('[HANGUP]', '').trim();
 
-      const ttsText = trimForTTS(aiReply, 250);
-      if (ttsText !== aiReply) console.log(`[TTS] Texto recortado de ${aiReply.length} a ${ttsText.length} chars`);
+      console.log(`[AI] "${cleanReply}"${shouldHangup ? ' [COLGANDO]' : ''}`);
 
-      history.push({ role: 'user', text: transcript, ts: new Date().toISOString() }, { role: 'assistant', text: aiReply, ts: new Date().toISOString() });
+      katuzEmitTranscript('asesor', cleanReply);
+      katuzAnalyze('asesor', cleanReply);
+
+      const ttsText = trimForTTS(cleanReply, 250);
+
+      history.push({ role: 'user', text: transcript, ts: new Date().toISOString() }, { role: 'assistant', text: cleanReply, ts: new Date().toISOString() });
       supabase.from('voice_calls').update({ transcript: history, turn_count: turnCount, last_activity_at: new Date().toISOString() }).eq('call_sid', resolvedCallSid).then(() => {});
 
       if (signal?.aborted) return;
       pendingMark = true;
       await streamTTSToTwilio(ttsText, va, streamSid, twilioWs, signal);
       if (signal?.aborted) pendingMark = false;
+
+      // Colgar después de que el TTS termine
+      if (shouldHangup) {
+        setTimeout(() => {
+          console.log('[voice-stream] Colgando después de despedida...');
+          hangupCall();
+        }, 1500);
+      }
     } catch (err) {
       if (err.name !== 'AbortError') console.error('[pipeline] Error:', err.message);
       pendingMark = false;
@@ -252,7 +363,7 @@ wss.on('connection', (twilioWs, req) => {
     try {
       while (true) {
         if (signal?.aborted) return null;
-        const requestBody = { model, max_tokens: 150, messages };
+        const requestBody = { model, max_tokens: 180, messages };
         if (tools.length > 0) { requestBody.tools = tools; requestBody.tool_choice = 'auto'; }
         const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` }, body: JSON.stringify(requestBody), signal });
         const data = await res.json();
@@ -315,7 +426,6 @@ wss.on('connection', (twilioWs, req) => {
       if (params.callSid) resolvedCallSid = params.callSid;
       if (params.phone) resolvedPhone = normalizePhone(params.phone);
       else if (resolvedPhone === '') resolvedPhone = normalizePhone(url.searchParams.get('phone') ?? '');
-      // Leer el número del cliente desde customParameters
       if (params.from) callerPhone = normalizePhone(params.from);
       console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} to="${resolvedPhone}" from="${callerPhone}"`);
       loadAssistant(resolvedPhone).then(() => {
