@@ -13,7 +13,6 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GOOGLE_TTS_KEY_PATH = process.env.GOOGLE_TTS_KEY_PATH;
 
-const EXTERNAL_API_PROXY = `${SUPABASE_URL}/functions/v1/external-api-proxy`;
 const KATUZ_ENGINE_URL = `${SUPABASE_URL}/functions/v1/katuz-engine`;
 
 // ─── Google Auth token cache ──────────────────────────────────────────────────
@@ -72,13 +71,9 @@ function trimForTTS(text, maxChars = 250) {
 function convertMp3ToMulaw(inputBuffer) {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', [
-      '-f', 'mp3',
-      '-i', 'pipe:0',
-      '-ar', '8000',
-      '-ac', '1',
-      '-acodec', 'pcm_mulaw',
-      '-f', 'mulaw',
-      'pipe:1',
+      '-f', 'mp3', '-i', 'pipe:0',
+      '-ar', '8000', '-ac', '1',
+      '-acodec', 'pcm_mulaw', '-f', 'mulaw', 'pipe:1',
     ]);
     const chunks = [];
     ffmpeg.stdout.on('data', chunk => chunks.push(chunk));
@@ -103,6 +98,62 @@ async function streamTTSToTwilio(text, va, streamSid, twilioWs, signal) {
   }
 }
 
+// ─── Construir OpenAI tools desde integraciones dinámicas ────────────────────
+function buildToolsFromIntegrations(integrations) {
+  if (!integrations || integrations.length === 0) return [];
+  return integrations.map(integration => {
+    const properties = {};
+    const required = [];
+    if (integration.parameters && integration.parameters.length > 0) {
+      for (const param of integration.parameters) {
+        properties[param.name] = {
+          type: param.type ?? 'string',
+          description: param.description ?? param.name,
+        };
+        if (param.required) required.push(param.name);
+      }
+    }
+    return {
+      type: 'function',
+      function: {
+        name: integration.name,
+        description: integration.description,
+        parameters: {
+          type: 'object',
+          properties,
+          required,
+        },
+      },
+    };
+  });
+}
+
+// ─── Ejecutar integración dinámica directo a la API configurada ───────────────
+async function callDynamicIntegration(integration, params) {
+  console.log(`[integration] Llamando: ${integration.name} → ${integration.url}`);
+  try {
+    const headers = { 'Content-Type': 'application/json', ...(integration.headers ?? {}) };
+    const method = (integration.method ?? 'POST').toUpperCase();
+    const body = method === 'GET' ? undefined : JSON.stringify(params);
+    const url = method === 'GET'
+      ? `${integration.url}?${new URLSearchParams(params).toString()}`
+      : integration.url;
+
+    const res = await fetch(url, { method, headers, body });
+    const data = await res.json();
+    console.log(`[integration] Respuesta ${integration.name}:`, JSON.stringify(data).slice(0, 300));
+
+    // Incluir response_mapping como contexto para que GPT interprete mejor
+    return {
+      result: data,
+      interpretation_guide: integration.response_mapping ?? '',
+    };
+  } catch (err) {
+    console.error(`[integration] Error en ${integration.name}:`, err.message);
+    return { error: err.message };
+  }
+}
+
 wss.on('connection', (twilioWs, req) => {
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
   const url = new URL(req.url, 'http://localhost');
@@ -123,7 +174,7 @@ wss.on('connection', (twilioWs, req) => {
   let pendingMark = false;
   const callStartTime = Date.now();
 
-  // ─── KATUZ state ─────────────────────────────────────────────────────────
+  // ─── KATUZ state ──────────────────────────────────────────────────────────
   let katuzSessionId = null;
   let katuzEnabled = false;
   let katuzTurnCount = 0;
@@ -171,15 +222,11 @@ wss.on('connection', (twilioWs, req) => {
     if (!katuzEnabled || !katuzSessionId) return;
     fetch(KATUZ_ENGINE_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` },
       body: JSON.stringify({
         session_id: katuzSessionId,
         tenant_id: katuzTenantId,
-        speaker,
-        text,
+        speaker, text,
         turn: katuzTurnCount,
         ts_offset_ms: Date.now() - callStartTime,
       }),
@@ -199,7 +246,7 @@ wss.on('connection', (twilioWs, req) => {
       console.error('[Katuz] finalizeSession error:', err.message);
     }
   }
-  // ─── fin KATUZ state ──────────────────────────────────────────────────────
+  // ─── fin KATUZ ────────────────────────────────────────────────────────────
 
   function normalizePhone(phone) {
     return decodeURIComponent(phone).replace(/\s/g, '').replace(/\+/g, '+');
@@ -212,10 +259,7 @@ wss.on('connection', (twilioWs, req) => {
       twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
       console.log('[barge-in] Clear enviado a Twilio');
     }
-    if (currentAbortController) {
-      currentAbortController.abort();
-      currentAbortController = null;
-    }
+    if (currentAbortController) { currentAbortController.abort(); currentAbortController = null; }
     isSpeaking = false;
     pendingMark = false;
   }
@@ -243,9 +287,9 @@ wss.on('connection', (twilioWs, req) => {
       .single()
       .then(({ data, error }) => {
         va = data;
-        console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} proveedor: ${va?.tts_provider ?? 'elevenlabs'} error: ${error?.message ?? 'none'}`);
+        const integrationCount = va?.integrations?.length ?? 0;
+        console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} proveedor: ${va?.tts_provider ?? 'elevenlabs'} integraciones: ${integrationCount} error: ${error?.message ?? 'none'}`);
 
-        // Iniciar sesión Katuz — tenant_id viene de assistants
         if (va?.katuz_enabled && va?.assistants?.tenant_id) {
           supabase.from('voice_calls')
             .select('id')
@@ -257,42 +301,6 @@ wss.on('connection', (twilioWs, req) => {
         }
       });
   }
-
-  async function callExternalTool(toolName, params) {
-    console.log(`[function-calling] Llamando tool: ${toolName}`, params);
-    try {
-      const res = await fetch(EXTERNAL_API_PROXY, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` },
-        body: JSON.stringify({ tool: toolName, params }),
-      });
-      const data = await res.json();
-      console.log(`[function-calling] Resultado ${toolName}:`, JSON.stringify(data));
-      return data;
-    } catch (err) {
-      console.error(`[function-calling] Error en ${toolName}:`, err.message);
-      return { error: err.message };
-    }
-  }
-
-  const OPENAI_TOOLS = [
-    {
-      type: 'function',
-      function: {
-        name: 'validar_cobertura',
-        description: 'Valida si una dirección tiene cobertura de entrega de KFC y retorna la sucursal más cercana.',
-        parameters: { type: 'object', properties: { direccion: { type: 'string', description: 'Dirección completa del cliente' } }, required: ['direccion'] },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'consultar_pedido',
-        description: 'Consulta si el cliente tiene un pedido reciente en base al número de teléfono.',
-        parameters: { type: 'object', properties: { telefono: { type: 'string', description: 'Número de teléfono del cliente' } }, required: ['telefono'] },
-      },
-    },
-  ];
 
   async function runPipeline(transcript, signal) {
     try {
@@ -312,13 +320,19 @@ wss.on('connection', (twilioWs, req) => {
 
       const systemPrompt = va.assistants?.prompt ?? 'Eres un asistente útil.';
       const model = va.assistants?.llm_model ?? 'gpt-4o-mini';
+
+      // Construir tools dinámicamente desde las integraciones del asistente
+      const integrations = va.integrations ?? [];
+      const dynamicTools = buildToolsFromIntegrations(integrations);
+      console.log(`[pipeline] Tools disponibles: ${dynamicTools.map(t => t.function.name).join(', ') || 'ninguna'}`);
+
       const messages = [
         { role: 'system', content: systemPrompt + '\n\nIMPORTANTE: Responde de forma CORTA y NATURAL para una llamada telefónica. Máximo 2-3 oraciones cortas. Sin listas ni bullets.' },
         ...historyMessages,
         { role: 'user', content: transcript },
       ];
 
-      const aiReply = await callOpenAIWithTools(model, messages, OPENAI_TOOLS, signal);
+      const aiReply = await callOpenAIWithDynamicTools(model, messages, dynamicTools, integrations, signal);
       if (!aiReply || signal?.aborted) return;
 
       console.log(`[AI] "${aiReply}"`);
@@ -347,25 +361,47 @@ wss.on('connection', (twilioWs, req) => {
     }
   }
 
-  async function callOpenAIWithTools(model, messages, tools, signal) {
+  async function callOpenAIWithDynamicTools(model, messages, tools, integrations, signal) {
     try {
       while (true) {
         if (signal?.aborted) return null;
+
+        const requestBody = { model, max_tokens: 150, messages };
+        if (tools.length > 0) {
+          requestBody.tools = tools;
+          requestBody.tool_choice = 'auto';
+        }
+
         const res = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
-          body: JSON.stringify({ model, max_tokens: 150, messages, tools, tool_choice: 'auto' }),
+          body: JSON.stringify(requestBody),
           signal,
         });
         const data = await res.json();
         const msg = data.choices?.[0]?.message;
         if (!msg) return 'Lo siento, ocurrió un error.';
         if (!msg.tool_calls || msg.tool_calls.length === 0) return msg.content?.trim() ?? 'Lo siento, ocurrió un error.';
+
         console.log(`[function-calling] OpenAI solicitó ${msg.tool_calls.length} tool(s)`);
         messages.push(msg);
+
         for (const toolCall of msg.tool_calls) {
           if (signal?.aborted) return null;
-          const toolResult = await callExternalTool(toolCall.function.name, JSON.parse(toolCall.function.arguments));
+          const toolName = toolCall.function.name;
+          const toolParams = JSON.parse(toolCall.function.arguments);
+
+          // Buscar la integración correspondiente
+          const integration = integrations.find(i => i.name === toolName);
+          let toolResult;
+
+          if (integration) {
+            // Llamada dinámica directo a la API configurada
+            toolResult = await callDynamicIntegration(integration, toolParams);
+          } else {
+            toolResult = { error: `Integración "${toolName}" no encontrada` };
+          }
+
           messages.push({ role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify(toolResult) });
         }
       }
@@ -477,7 +513,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[voice-stream] Listening on port ${PORT}`);
 });
 
-// ─── ElevenLabs TTS — streaming verdadero ────────────────────────────────────
+// ─── ElevenLabs TTS ───────────────────────────────────────────────────────────
 async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_5', streamSid, twilioWs, signal) {
   try {
     const res = await fetch(
@@ -517,7 +553,7 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
   }
 }
 
-// ─── OpenAI TTS — MP3 via ffmpeg → mulaw ─────────────────────────────────────
+// ─── OpenAI TTS ───────────────────────────────────────────────────────────────
 async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', streamSid, twilioWs, signal) {
   try {
     console.log(`[OpenAI TTS] voz=${voice} modelo=${model}`);
@@ -552,7 +588,6 @@ async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', language
     console.log(`[Google TTS] voz=${voice} idioma=${languageCode}`);
     const accessToken = await getGoogleAccessToken();
     if (signal?.aborted) return;
-
     const res = await fetch('https://texttospeech.googleapis.com/v1/text:synthesize', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -563,19 +598,15 @@ async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', language
       }),
       signal,
     });
-
     if (!res.ok) { console.error(`[Google TTS] Error ${res.status}:`, await res.text()); return; }
     if (signal?.aborted) return;
-
     const data = await res.json();
     const mp3Buffer = Buffer.from(data.audioContent, 'base64');
     console.log(`[Google TTS] MP3: ${mp3Buffer.length} bytes`);
     if (signal?.aborted) return;
-
     const mulawBuffer = await convertMp3ToMulaw(mp3Buffer);
     console.log(`[Google TTS] mulaw: ${mulawBuffer.length} bytes`);
     if (signal?.aborted) return;
-
     const chunkSize = 640;
     for (let i = 0; i < mulawBuffer.length; i += chunkSize) {
       if (signal?.aborted) return;
