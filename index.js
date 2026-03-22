@@ -109,7 +109,9 @@ wss.on('connection', (twilioWs, req) => {
   const url = new URL(req.url, 'http://localhost');
   const callSid = url.searchParams.get('call_sid') ?? '';
   const phoneParam = normalizePhone(url.searchParams.get('phone') ?? '');
-  console.log(`[voice-stream] callSid=${callSid} phone=${phoneParam}`);
+  // callerPhone = número de quien llama (From), phoneParam = número del asistente (To)
+  const callerPhone = normalizePhone(url.searchParams.get('from') ?? '');
+  console.log(`[voice-stream] callSid=${callSid} to=${phoneParam} from=${callerPhone}`);
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
   let streamSid = '';
@@ -131,7 +133,7 @@ wss.on('connection', (twilioWs, req) => {
 
   async function katuzCreateSession(voiceCallId, tenantId, assistantId) {
     try {
-      const { data, error } = await supabase.from('katuz_sessions').insert({ call_sid: resolvedCallSid, voice_call_id: voiceCallId ?? null, tenant_id: tenantId, assistant_id: assistantId ?? null, phone_from: resolvedPhone, status: 'active', started_at: new Date().toISOString() }).select('id').single();
+      const { data, error } = await supabase.from('katuz_sessions').insert({ call_sid: resolvedCallSid, voice_call_id: voiceCallId ?? null, tenant_id: tenantId, assistant_id: assistantId ?? null, phone_from: callerPhone || resolvedPhone, status: 'active', started_at: new Date().toISOString() }).select('id').single();
       if (error) { console.error('[Katuz] Error creando sesión:', error.message); return; }
       katuzSessionId = data.id; katuzEnabled = true; katuzTenantId = tenantId;
       console.log(`[Katuz] Sesión creada: ${katuzSessionId} tenant: ${tenantId}`);
@@ -206,16 +208,16 @@ wss.on('connection', (twilioWs, req) => {
 
       if (signal?.aborted) return;
 
-      // ── Inyectar variables dinámicas en el prompt ──────────────────────────
+      // Inyectar variables dinámicas — {{phone}} = número del cliente (From)
       const rawPrompt = va.assistants?.prompt ?? 'Eres un asistente útil.';
       const systemPrompt = rawPrompt
-        .replace(/\{\{phone\}\}/g, resolvedPhone || 'desconocido')
+        .replace(/\{\{phone\}\}/g, callerPhone || 'desconocido')
         .replace(/\{\{call_sid\}\}/g, resolvedCallSid || '');
 
       const model = va.assistants?.llm_model ?? 'gpt-4o-mini';
       const integrations = va.integrations ?? [];
       const dynamicTools = buildToolsFromIntegrations(integrations);
-      console.log(`[pipeline] Tools disponibles: ${dynamicTools.map(t => t.function.name).join(', ') || 'ninguna'}`);
+      console.log(`[pipeline] caller=${callerPhone} tools: ${dynamicTools.map(t => t.function.name).join(', ') || 'ninguna'}`);
 
       const messages = [
         { role: 'system', content: systemPrompt + '\n\nIMPORTANTE: Responde de forma CORTA y NATURAL para una llamada telefónica. Máximo 2-3 oraciones cortas. Sin listas ni bullets.' },
@@ -313,7 +315,7 @@ wss.on('connection', (twilioWs, req) => {
       if (params.callSid) resolvedCallSid = params.callSid;
       if (params.phone) resolvedPhone = normalizePhone(params.phone);
       else if (resolvedPhone === '') resolvedPhone = normalizePhone(url.searchParams.get('phone') ?? '');
-      console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} phone="${resolvedPhone}"`);
+      console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} to="${resolvedPhone}" from="${callerPhone}"`);
       loadAssistant(resolvedPhone).then(() => {
         setTimeout(async () => {
           if (!va) { console.error('[voice-stream] va sigue null después de cargar'); return; }
