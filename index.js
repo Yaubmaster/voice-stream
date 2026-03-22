@@ -109,8 +109,8 @@ wss.on('connection', (twilioWs, req) => {
   const url = new URL(req.url, 'http://localhost');
   const callSid = url.searchParams.get('call_sid') ?? '';
   const phoneParam = normalizePhone(url.searchParams.get('phone') ?? '');
-  // callerPhone = número de quien llama (From), phoneParam = número del asistente (To)
-  const callerPhone = normalizePhone(url.searchParams.get('from') ?? '');
+  // callerPhone = número de quien llama (From) — se actualiza en evento start
+  let callerPhone = normalizePhone(url.searchParams.get('from') ?? '');
   console.log(`[voice-stream] callSid=${callSid} to=${phoneParam} from=${callerPhone}`);
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -208,7 +208,7 @@ wss.on('connection', (twilioWs, req) => {
 
       if (signal?.aborted) return;
 
-      // Inyectar variables dinámicas — {{phone}} = número del cliente (From)
+      // {{phone}} = número del cliente (From), {{call_sid}} = CallSid
       const rawPrompt = va.assistants?.prompt ?? 'Eres un asistente útil.';
       const systemPrompt = rawPrompt
         .replace(/\{\{phone\}\}/g, callerPhone || 'desconocido')
@@ -315,6 +315,8 @@ wss.on('connection', (twilioWs, req) => {
       if (params.callSid) resolvedCallSid = params.callSid;
       if (params.phone) resolvedPhone = normalizePhone(params.phone);
       else if (resolvedPhone === '') resolvedPhone = normalizePhone(url.searchParams.get('phone') ?? '');
+      // Leer el número del cliente desde customParameters
+      if (params.from) callerPhone = normalizePhone(params.from);
       console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} to="${resolvedPhone}" from="${callerPhone}"`);
       loadAssistant(resolvedPhone).then(() => {
         setTimeout(async () => {
