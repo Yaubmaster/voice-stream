@@ -12,6 +12,12 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GOOGLE_TTS_KEY_PATH = process.env.GOOGLE_TTS_KEY_PATH;
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const AZURE_OPENAI_KEY = process.env.AZURE_OPENAI_KEY;
+const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT;
+const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT;
+const AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION;
 
 const KATUZ_ENGINE_URL = `${SUPABASE_URL}/functions/v1/katuz-engine`;
 
@@ -104,27 +110,20 @@ async function callDynamicIntegration(integration, params) {
   }
 }
 
-// ─── Inferir outcome + variables custom al final de llamada ──────────────────
 async function inferCallOutcome(transcript, dashboardType, outcomeVariables) {
   if (!transcript || transcript.length < 2) return { outcome: null, variables: {} };
-
   const lastTurns = transcript.slice(-8).map(t => `${t.role}: ${t.text}`).join('\n');
-
   const outcomeByType = {
     ventas: '"completed" si se tomó un pedido o venta exitosa, "coverage_failed" si no hay cobertura, "abandoned" si el cliente colgó sin comprar, "escalated" si se transfirió',
     cobranza: '"promise" si el cliente prometió pagar, "refused" si se negó, "wrong_contact" si no era la persona correcta, "callback" si pidió que lo llamen después, "abandoned" si colgó',
     atencion: '"resolved" si se resolvió el problema, "escalated" si se transfirió a humano, "unresolved" si no se pudo resolver, "abandoned" si colgó sin resolver',
   };
-
   const outcomeOptions = outcomeByType[dashboardType ?? 'atencion'];
-
-  // Construir instrucciones para variables custom
   let variableInstructions = '';
   if (outcomeVariables && outcomeVariables.length > 0) {
     variableInstructions = `\nTambién extrae estas variables de la conversación (null si no se mencionaron):\n` +
       outcomeVariables.map(v => `- "${v.key}": ${v.description}`).join('\n');
   }
-
   const systemPrompt = `Analiza esta conversación de contact center.
 Responde SOLO con JSON válido sin markdown:
 {
@@ -132,20 +131,11 @@ Responde SOLO con JSON válido sin markdown:
   "outcome_reason": "frase corta explicando por qué"${outcomeVariables?.length > 0 ? `,
   "variables": {${outcomeVariables?.map(v => `"${v.key}": null`).join(', ')}}` : ''}
 }${variableInstructions}`;
-
   try {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        max_tokens: 200,
-        temperature: 0.1,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: lastTurns }
-        ]
-      })
+      body: JSON.stringify({ model: 'gpt-4o-mini', max_tokens: 200, temperature: 0.1, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: lastTurns }] })
     });
     const data = await res.json();
     const raw = data.choices?.[0]?.message?.content?.trim() ?? '{}';
@@ -177,10 +167,10 @@ wss.on('connection', (twilioWs, req) => {
   let currentAbortController = null;
   let isSpeaking = false;
   let pendingMark = false;
-  const callStartTime = Date.now();
   let callFinalized = false;
+  let recordingSid = null;
+  const callStartTime = Date.now();
 
-  // ─── KATUZ state ──────────────────────────────────────────────────────────
   let katuzSessionId = null;
   let katuzEnabled = false;
   let katuzTurnCount = 0;
@@ -234,16 +224,11 @@ wss.on('connection', (twilioWs, req) => {
     console.log(`[voice-stream] Finalizando llamada — duración: ${durationSeconds}s`);
 
     try {
-      // Obtener transcript completo y datos del asistente para inferir outcome
       const { data: callData } = await supabase.from('voice_calls').select('transcript').eq('call_sid', resolvedCallSid).single();
       const transcript = callData?.transcript ?? [];
-
-      // Obtener dashboard_type y outcome_variables del asistente
       const dashboardType = va?.assistants?.dashboard_type ?? 'atencion';
       const outcomeVariables = va?.assistants?.outcome_variables ?? [];
-
-      // Inferir outcome con GPT
-      const { outcome, variables, reason } = await inferCallOutcome(transcript, dashboardType, outcomeVariables);
+      const { outcome, variables } = await inferCallOutcome(transcript, dashboardType, outcomeVariables);
 
       await supabase.from('voice_calls').update({
         status: 'completed',
@@ -254,6 +239,34 @@ wss.on('connection', (twilioWs, req) => {
       }).eq('call_sid', resolvedCallSid);
 
       console.log(`[voice-stream] Llamada finalizada — outcome: ${outcome} variables: ${JSON.stringify(variables)}`);
+
+      // Descargar y subir grabacion si existe y duracion >= 20s
+      if (recordingSid && durationSeconds >= 20) {
+        setTimeout(async () => {
+          try {
+            console.log(`[Recording] Descargando ${recordingSid}...`);
+            await new Promise(r => setTimeout(r, 5000));
+            const audioRes = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.mp3`, {
+              headers: { 'Authorization': 'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64') }
+            });
+            if (audioRes.ok) {
+              const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
+              const fileName = `${resolvedCallSid}.mp3`;
+              const { error: uploadError } = await supabase.storage.from('call-recordings').upload(fileName, audioBuffer, { contentType: 'audio/mpeg', upsert: true });
+              if (!uploadError) {
+                const { data: urlData } = supabase.storage.from('call-recordings').getPublicUrl(fileName);
+                await supabase.from('voice_calls').update({ recording_sid: recordingSid, recording_url: urlData?.publicUrl }).eq('call_sid', resolvedCallSid);
+                console.log(`[Recording] Subida exitosa: ${fileName}`);
+              } else {
+                console.error('[Recording] Error subiendo:', uploadError.message);
+              }
+            } else {
+              console.error('[Recording] Error descargando de Twilio:', audioRes.status, await audioRes.text());
+            }
+          } catch(e) { console.error('[Recording] Error:', e.message); }
+        }, 3000);
+      }
+
     } catch (err) {
       console.error('[finalizeCall] Error:', err.message);
       await supabase.from('voice_calls').update({ status: 'completed', ended_at: new Date().toISOString(), duration_seconds: durationSeconds }).eq('call_sid', resolvedCallSid);
@@ -262,16 +275,14 @@ wss.on('connection', (twilioWs, req) => {
     await katuzFinalizeSession();
   }
 
-  // ─── Hangup — colgar la llamada desde el bot ──────────────────────────────
   function hangupCall() {
     console.log('[voice-stream] Colgando llamada...');
     if (twilioWs.readyState === WebSocket.OPEN) {
-      // Enviar TwiML para colgar via Twilio REST API
-      fetch(`https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls/${resolvedCallSid}.json`, {
+      fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${resolvedCallSid}.json`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Authorization': 'Basic ' + Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')
+          'Authorization': 'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64')
         },
         body: 'Status=completed'
       }).then(() => console.log('[voice-stream] Llamada colgada via Twilio API'))
@@ -327,7 +338,6 @@ wss.on('connection', (twilioWs, req) => {
       const aiReply = await callOpenAIWithDynamicTools(model, messages, dynamicTools, integrations, signal);
       if (!aiReply || signal?.aborted) return;
 
-      // Detectar si el bot debe colgar
       const shouldHangup = aiReply.includes('[HANGUP]');
       const cleanReply = aiReply.replace('[HANGUP]', '').trim();
 
@@ -346,12 +356,13 @@ wss.on('connection', (twilioWs, req) => {
       await streamTTSToTwilio(ttsText, va, streamSid, twilioWs, signal);
       if (signal?.aborted) pendingMark = false;
 
-      // Colgar después de que el TTS termine
       if (shouldHangup) {
+        const despedidaMs = Math.max(4000, (ttsText.length / 15) * 1000);
+        console.log(`[voice-stream] Esperando ${Math.round(despedidaMs/1000)}s antes de colgar...`);
         setTimeout(() => {
           console.log('[voice-stream] Colgando después de despedida...');
           hangupCall();
-        }, 1500);
+        }, despedidaMs);
       }
     } catch (err) {
       if (err.name !== 'AbortError') console.error('[pipeline] Error:', err.message);
@@ -365,11 +376,35 @@ wss.on('connection', (twilioWs, req) => {
         if (signal?.aborted) return null;
         const requestBody = { model, max_tokens: 180, messages };
         if (tools.length > 0) { requestBody.tools = tools; requestBody.tool_choice = 'auto'; }
-        const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` }, body: JSON.stringify(requestBody), signal });
-        const data = await res.json();
+
+        const useAzure = AZURE_OPENAI_KEY && AZURE_OPENAI_ENDPOINT;
+        const apiUrl = useAzure
+          ? `${AZURE_OPENAI_ENDPOINT}/openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${AZURE_OPENAI_API_VERSION}`
+          : 'https://api.openai.com/v1/chat/completions';
+        const apiHeaders = useAzure
+          ? { 'Content-Type': 'application/json', 'api-key': AZURE_OPENAI_KEY }
+          : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` };
+        const reqBody = useAzure ? { ...requestBody } : requestBody;
+        if (useAzure) delete reqBody.model;
+
+        let res, data, retries = 0;
+        while (retries < 3) {
+          res = await fetch(apiUrl, { method: 'POST', headers: apiHeaders, body: JSON.stringify(reqBody), signal });
+          data = await res.json();
+          if (res.status === 429 || res.status === 503) {
+            retries++;
+            console.warn(`[OpenAI] Rate limit/503, reintento ${retries}/3...`);
+            await new Promise(r => setTimeout(r, 9000));
+            continue;
+          }
+          break;
+        }
+        if (!res.ok || data.error) { console.error('[OpenAI] API error:', JSON.stringify(data.error ?? data)); return 'Lo siento, ocurrió un error.'; }
+
         const msg = data.choices?.[0]?.message;
-        if (!msg) return 'Lo siento, ocurrió un error.';
+        if (!msg) { console.error('[OpenAI] msg null, choices:', JSON.stringify(data.choices)); return 'Lo siento, ocurrió un error.'; }
         if (!msg.tool_calls || msg.tool_calls.length === 0) return msg.content?.trim() ?? 'Lo siento, ocurrió un error.';
+
         console.log(`[function-calling] OpenAI solicitó ${msg.tool_calls.length} tool(s)`);
         messages.push(msg);
         for (const toolCall of msg.tool_calls) {
@@ -428,6 +463,25 @@ wss.on('connection', (twilioWs, req) => {
       else if (resolvedPhone === '') resolvedPhone = normalizePhone(url.searchParams.get('phone') ?? '');
       if (params.from) callerPhone = normalizePhone(params.from);
       console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} to="${resolvedPhone}" from="${callerPhone}"`);
+
+      // Iniciar grabacion inmediatamente cuando comienza la llamada
+      fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${resolvedCallSid}/Recordings.json`, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'),
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: 'RecordingChannels=dual'
+      }).then(async (recRes) => {
+        const recData = await recRes.json();
+        if (recData.sid) {
+          recordingSid = recData.sid;
+          console.log(`[Recording] Iniciada: ${recData.sid}`);
+        } else {
+          console.error('[Recording] Error iniciando:', JSON.stringify(recData));
+        }
+      }).catch(e => console.error('[Recording] fetch error:', e.message));
+
       loadAssistant(resolvedPhone).then(() => {
         setTimeout(async () => {
           if (!va) { console.error('[voice-stream] va sigue null después de cargar'); return; }
