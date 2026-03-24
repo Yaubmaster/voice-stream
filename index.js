@@ -93,6 +93,9 @@ function buildToolsFromIntegrations(integrations) {
   });
 }
 
+let _currentCallSid = null;
+let _currentSupabase = null;
+
 async function callDynamicIntegration(integration, params) {
   console.log(`[integration] Llamando: ${integration.name} → ${integration.url}`);
   try {
@@ -103,6 +106,14 @@ async function callDynamicIntegration(integration, params) {
     const res = await fetch(url, { method, headers, body });
     const data = await res.json();
     console.log(`[integration] Respuesta ${integration.name}:`, JSON.stringify(data).slice(0, 300));
+    if (integration.name === 'validar_cobertura' && _currentCallSid && _currentSupabase) {
+      const cobertura = data?.success === true ? 'coverage_validated' : 'coverage_failed';
+      _currentSupabase.from('voice_calls').update({ 
+        funnel_stage: cobertura,
+        outcome_variables: { cobertura_positiva: data?.success === true, cobertura_negativa: data?.success !== true }
+      }).eq('call_sid', _currentCallSid).then(() => {});
+      console.log(`[cobertura] funnel_stage=${cobertura}`);
+    }
     return { result: data, interpretation_guide: integration.response_mapping ?? '' };
   } catch (err) {
     console.error(`[integration] Error en ${integration.name}:`, err.message);
@@ -169,6 +180,8 @@ wss.on('connection', (twilioWs, req) => {
   let pendingMark = false;
   let callFinalized = false;
   let recordingSid = null;
+  _currentCallSid = callSid;
+  _currentSupabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
   const callStartTime = Date.now();
 
   let katuzSessionId = null;
