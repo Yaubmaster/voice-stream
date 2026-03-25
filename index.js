@@ -144,7 +144,8 @@ Responde SOLO con JSON válido sin markdown:
   "outcome": "<una de: ${outcomeOptions}>",
   "outcome_reason": "frase corta explicando por qué",
   "quality_score": <numero del 0 al 100 basado en empatia, resolucion y adherencia al flujo>,
-  "sentiment": "<positive|neutral|negative>"${outcomeVariables?.length > 0 ? `,
+  "sentiment": "<positive|neutral|negative>",
+  "analysis": "<parrafo de 2-3 oraciones describiendo que paso en la llamada, que queria el cliente y como respondio el asistente>"${outcomeVariables?.length > 0 ? `,
   "variables": {${outcomeVariables?.map(v => `"${v.key}": null`).join(', ')}}` : ''}
 }${variableInstructions}`;
   try {
@@ -157,7 +158,7 @@ Responde SOLO con JSON válido sin markdown:
     const raw = data.choices?.[0]?.message?.content?.trim() ?? '{}';
     const parsed = JSON.parse(raw);
     console.log(`[outcome] Detectado: ${parsed.outcome} — ${parsed.outcome_reason} | score: ${parsed.quality_score} | sentiment: ${parsed.sentiment}`);
-    return { outcome: parsed.outcome, variables: parsed.variables ?? {}, reason: parsed.outcome_reason, quality_score: parsed.quality_score ?? null, sentiment: parsed.sentiment ?? null };
+    return { outcome: parsed.outcome, variables: parsed.variables ?? {}, reason: parsed.outcome_reason, quality_score: parsed.quality_score ?? null, sentiment: parsed.sentiment ?? null, analysis: parsed.analysis ?? null };
   } catch (err) {
     console.error('[outcome] Error infiriendo outcome:', err.message);
     return { outcome: null, variables: {} };
@@ -256,7 +257,7 @@ wss.on('connection', (twilioWs, req) => {
       const transcript = callData?.transcript ?? [];
       const dashboardType = va?.assistants?.dashboard_type ?? 'atencion';
       const outcomeVariables = va?.assistants?.outcome_variables ?? [];
-      const { outcome, variables, quality_score, sentiment } = await inferCallOutcome(transcript, dashboardType, outcomeVariables);
+      const { outcome, variables, quality_score, sentiment, analysis } = await inferCallOutcome(transcript, dashboardType, outcomeVariables);
 
       await supabase.from('voice_calls').update({
         status: 'completed',
@@ -265,7 +266,7 @@ wss.on('connection', (twilioWs, req) => {
         outcome: outcome,
         quality_score: quality_score,
         sentiment: sentiment,
-        ai_analysis: { outcome: outcome, quality_score: quality_score, sentiment: sentiment },
+        ai_analysis: { outcome: outcome, quality_score: quality_score, sentiment: sentiment, analysis: analysis },
         ...(Object.keys(variables).length > 0 ? { outcome_variables: variables } : {}),
       }).eq('call_sid', resolvedCallSid);
 
