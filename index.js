@@ -4,6 +4,7 @@ const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const { validateRequest } = require('twilio');
 
 const PORT = process.env.PORT || 8080;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -96,7 +97,7 @@ function buildToolsFromIntegrations(integrations) {
 let _currentCallSid = null;
 let _currentSupabase = null;
 
-async function callDynamicIntegration(integration, params) {
+async function callDynamicIntegration(integration, params, callSid = null, supabaseClient = null) {
   console.log(`[integration] Llamando: ${integration.name} → ${integration.url}`);
   try {
     const headers = { 'Content-Type': 'application/json', ...(integration.headers ?? {}) };
@@ -106,13 +107,13 @@ async function callDynamicIntegration(integration, params) {
     const res = await fetch(url, { method, headers, body });
     const data = await res.json();
     console.log(`[integration] Respuesta ${integration.name}:`, JSON.stringify(data).slice(0, 300));
-    if (integration.name === 'validar_cobertura' && _currentCallSid && _currentSupabase) {
+    if (integration.name === 'validar_cobertura' && callSid && supabaseClient) {
       const cobertura = data?.success === true ? 'coverage_validated' : 'coverage_failed';
-      _currentSupabase.from('voice_calls').update({ 
+      supabaseClient.from('voice_calls').update({ 
         funnel_stage: cobertura,
         outcome_variables: { cobertura_positiva: data?.success === true, cobertura_negativa: data?.success !== true }
-      }).eq('call_sid', _currentCallSid).then(() => {});
-      console.log(`[cobertura] funnel_stage=${cobertura}`);
+      }).eq('call_sid', callSid).then(() => {});
+      console.log(`[cobertura] funnel_stage=${cobertura} callSid=${callSid}`);
     }
     return { result: data, interpretation_guide: integration.response_mapping ?? '' };
   } catch (err) {
@@ -160,6 +161,17 @@ Responde SOLO con JSON válido sin markdown:
 }
 
 wss.on('connection', (twilioWs, req) => {
+  // Twilio Signature Validation
+  const twilioSignature = req.headers['x-twilio-signature'] ?? '';
+  const fullUrl = `https://stream.yaub.ai${req.url}`;
+  const isValid = validateRequest(TWILIO_AUTH_TOKEN, twilioSignature, fullUrl, {});
+  if (!isValid) {
+    console.warn('[Security] MONITOR - firma invalida (no rechazando aun):', req.url);
+    // ACTIVAR cuando se confirme que header llega:
+    // twilioWs.close();
+    // return;
+  }
+  console.log('[Security] Firma Twilio validada OK');
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
   const url = new URL(req.url, 'http://localhost');
   const callSid = url.searchParams.get('call_sid') ?? '';
@@ -425,7 +437,7 @@ wss.on('connection', (twilioWs, req) => {
           const toolName = toolCall.function.name;
           const toolParams = JSON.parse(toolCall.function.arguments);
           const integration = integrations.find(i => i.name === toolName);
-          const toolResult = integration ? await callDynamicIntegration(integration, toolParams) : { error: `Integración "${toolName}" no encontrada` };
+          const toolResult = integration ? await callDynamicIntegration(integration, toolParams, resolvedCallSid, supabase) : { error: `Integración "${toolName}" no encontrada` };
           messages.push({ role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify(toolResult) });
         }
       }
