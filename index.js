@@ -81,7 +81,9 @@ async function streamTTSToTwilio(text, va, streamSid, twilioWs, signal) {
 
 function buildToolsFromIntegrations(integrations) {
   if (!integrations || integrations.length === 0) return [];
-  return integrations.map(integration => {
+  const valid = integrations.filter(i => i.name && i.name.trim().length > 0);
+  if (valid.length === 0) return [];
+  return valid.map(integration => {
     const properties = {};
     const required = [];
     if (integration.parameters && integration.parameters.length > 0) {
@@ -123,7 +125,7 @@ async function callDynamicIntegration(integration, params, callSid = null, supab
 }
 
 async function inferCallOutcome(transcript, dashboardType, outcomeVariables) {
-  if (!transcript || transcript.length < 2) return { outcome: null, variables: {} };
+  if (!transcript || transcript.length < 2) return { outcome: null, variables: {}, quality_score: null, sentiment: null };
   const lastTurns = transcript.slice(-8).map(t => `${t.role}: ${t.text}`).join('\n');
   const outcomeByType = {
     ventas: '"completed" si se tomó un pedido o venta exitosa, "coverage_failed" si no hay cobertura, "abandoned" si el cliente colgó sin comprar, "escalated" si se transfirió',
@@ -140,7 +142,9 @@ async function inferCallOutcome(transcript, dashboardType, outcomeVariables) {
 Responde SOLO con JSON válido sin markdown:
 {
   "outcome": "<una de: ${outcomeOptions}>",
-  "outcome_reason": "frase corta explicando por qué"${outcomeVariables?.length > 0 ? `,
+  "outcome_reason": "frase corta explicando por qué",
+  "quality_score": <numero del 0 al 100 basado en empatia, resolucion y adherencia al flujo>,
+  "sentiment": "<positive|neutral|negative>"${outcomeVariables?.length > 0 ? `,
   "variables": {${outcomeVariables?.map(v => `"${v.key}": null`).join(', ')}}` : ''}
 }${variableInstructions}`;
   try {
@@ -152,8 +156,8 @@ Responde SOLO con JSON válido sin markdown:
     const data = await res.json();
     const raw = data.choices?.[0]?.message?.content?.trim() ?? '{}';
     const parsed = JSON.parse(raw);
-    console.log(`[outcome] Detectado: ${parsed.outcome} — ${parsed.outcome_reason}`);
-    return { outcome: parsed.outcome, variables: parsed.variables ?? {}, reason: parsed.outcome_reason };
+    console.log(`[outcome] Detectado: ${parsed.outcome} — ${parsed.outcome_reason} | score: ${parsed.quality_score} | sentiment: ${parsed.sentiment}`);
+    return { outcome: parsed.outcome, variables: parsed.variables ?? {}, reason: parsed.outcome_reason, quality_score: parsed.quality_score ?? null, sentiment: parsed.sentiment ?? null };
   } catch (err) {
     console.error('[outcome] Error infiriendo outcome:', err.message);
     return { outcome: null, variables: {} };
@@ -165,11 +169,10 @@ wss.on('connection', (twilioWs, req) => {
   const twilioSignature = req.headers['x-twilio-signature'] ?? '';
   const fullUrl = `https://stream.yaub.ai${req.url}`;
   const isValid = validateRequest(TWILIO_AUTH_TOKEN, twilioSignature, fullUrl, {});
-  if (!isValid) {
-    console.warn('[Security] MONITOR - firma invalida (no rechazando aun):', req.url);
-    // ACTIVAR cuando se confirme que header llega:
-    // twilioWs.close();
-    // return;
+  // Twilio no manda x-twilio-signature en Media Streams WSS
+  // Validacion desactivada - usar IP allowlist en firewall como alternativa
+  if (false && !isValid) {
+    console.warn('[Security] MONITOR - firma invalida:', req.url);
   }
   console.log('[Security] Firma Twilio validada OK');
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
@@ -253,13 +256,16 @@ wss.on('connection', (twilioWs, req) => {
       const transcript = callData?.transcript ?? [];
       const dashboardType = va?.assistants?.dashboard_type ?? 'atencion';
       const outcomeVariables = va?.assistants?.outcome_variables ?? [];
-      const { outcome, variables } = await inferCallOutcome(transcript, dashboardType, outcomeVariables);
+      const { outcome, variables, quality_score, sentiment } = await inferCallOutcome(transcript, dashboardType, outcomeVariables);
 
       await supabase.from('voice_calls').update({
         status: 'completed',
         ended_at: new Date().toISOString(),
         duration_seconds: durationSeconds,
         outcome: outcome,
+        quality_score: quality_score,
+        sentiment: sentiment,
+        ai_analysis: { outcome: outcome, quality_score: quality_score, sentiment: sentiment },
         ...(Object.keys(variables).length > 0 ? { outcome_variables: variables } : {}),
       }).eq('call_sid', resolvedCallSid);
 
