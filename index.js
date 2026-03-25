@@ -264,9 +264,9 @@ wss.on('connection', (twilioWs, req) => {
         ended_at: new Date().toISOString(),
         duration_seconds: durationSeconds,
         outcome: outcome,
-        quality_score: quality_score,
-        sentiment: sentiment,
-        ai_analysis: { outcome: outcome, quality_score: quality_score, sentiment: sentiment, analysis: analysis },
+        quality_score: finalScore,
+        sentiment: finalSentiment,
+        ai_analysis: { outcome: outcome, quality_score: finalScore, sentiment: finalSentiment, analysis: analysis },
         ...(Object.keys(variables).length > 0 ? { outcome_variables: variables } : {}),
       }).eq('call_sid', resolvedCallSid);
 
