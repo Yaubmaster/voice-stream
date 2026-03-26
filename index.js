@@ -5,17 +5,14 @@ const { createClient } = require('@supabase/supabase-js');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const { validateRequest } = require('twilio');
+const keyManager = require('./keyManager');
 
 const PORT = process.env.PORT || 8080;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GOOGLE_TTS_KEY_PATH = process.env.GOOGLE_TTS_KEY_PATH;
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const AZURE_OPENAI_KEY = process.env.AZURE_OPENAI_KEY;
 const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT;
 const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT;
 const AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION;
@@ -47,7 +44,17 @@ async function getGoogleAccessToken() {
   return googleAccessToken;
 }
 
-const server = http.createServer((req, res) => { res.writeHead(200); res.end('voice-stream ok'); });
+// ─── HTTP server + health endpoint ───────────────────────────────────────────
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', uptime: Math.round(process.uptime()), keys: keyManager.getStatus() }));
+    return;
+  }
+  res.writeHead(200);
+  res.end('voice-stream ok');
+});
+
 const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 
 function trimForTTS(text, maxChars = 250) {
@@ -96,9 +103,6 @@ function buildToolsFromIntegrations(integrations) {
   });
 }
 
-let _currentCallSid = null;
-let _currentSupabase = null;
-
 async function callDynamicIntegration(integration, params, callSid = null, supabaseClient = null) {
   console.log(`[integration] Llamando: ${integration.name} → ${integration.url}`);
   try {
@@ -111,7 +115,7 @@ async function callDynamicIntegration(integration, params, callSid = null, supab
     console.log(`[integration] Respuesta ${integration.name}:`, JSON.stringify(data).slice(0, 300));
     if (integration.name === 'validar_cobertura' && callSid && supabaseClient) {
       const cobertura = data?.success === true ? 'coverage_validated' : 'coverage_failed';
-      supabaseClient.from('voice_calls').update({ 
+      supabaseClient.from('voice_calls').update({
         funnel_stage: cobertura,
         outcome_variables: { cobertura_positiva: data?.success === true, cobertura_negativa: data?.success !== true }
       }).eq('call_sid', callSid).then(() => {});
@@ -148,13 +152,23 @@ Responde SOLO con JSON válido sin markdown:
   "analysis": "<parrafo de 2-3 oraciones describiendo que paso en la llamada, que queria el cliente y como respondio el asistente>"${outcomeVariables?.length > 0 ? `,
   "variables": {${outcomeVariables?.map(v => `"${v.key}": null`).join(', ')}}` : ''}
 }${variableInstructions}`;
+
+  // Usar keyManager para inferCallOutcome — fallback a OpenAI directo si Azure falla
+  const { key, endpoint, isAzure, onSuccess, onFailure } = keyManager.getLLMKey();
+  const apiUrl = isAzure
+    ? `${endpoint}/openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${AZURE_OPENAI_API_VERSION}`
+    : `${endpoint}/chat/completions`;
+  const apiHeaders = isAzure
+    ? { 'Content-Type': 'application/json', 'api-key': key }
+    : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` };
+  const reqBody = { max_tokens: 200, temperature: 0.1, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: lastTurns }] };
+  if (!isAzure) reqBody.model = 'gpt-4o-mini';
+
   try {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
-      body: JSON.stringify({ model: 'gpt-4o-mini', max_tokens: 200, temperature: 0.1, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: lastTurns }] })
-    });
+    const res = await fetch(apiUrl, { method: 'POST', headers: apiHeaders, body: JSON.stringify(reqBody) });
+    if (!res.ok) { onFailure(res.status); throw new Error(`LLM ${res.status}`); }
     const data = await res.json();
+    onSuccess();
     const raw = data.choices?.[0]?.message?.content?.trim() ?? '{}';
     const parsed = JSON.parse(raw);
     console.log(`[outcome] Detectado: ${parsed.outcome} — ${parsed.outcome_reason} | score: ${parsed.quality_score} | sentiment: ${parsed.sentiment}`);
@@ -165,18 +179,31 @@ Responde SOLO con JSON válido sin markdown:
   }
 }
 
+// ─── Deepgram connection usando keyManager ────────────────────────────────────
+function createDeepgramConnection() {
+  const { key, onSuccess, onFailure } = keyManager.getDeepgramKey();
+  const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
+    model: 'nova-2', language: 'es', encoding: 'mulaw', sample_rate: '8000',
+    channels: '1', interim_results: 'true', endpointing: '400'
+  }).toString();
+  const ws = new WebSocket(dgUrl, { headers: { Authorization: `Token ${key}` } });
+  ws.on('open', () => { onSuccess(); });
+  ws.on('error', (e) => {
+    const status = e?.status || 500;
+    if (status === 429 || status >= 500) onFailure(status);
+    console.error('[Deepgram] Error:', e.message);
+  });
+  return ws;
+}
+
 wss.on('connection', (twilioWs, req) => {
-  // Twilio Signature Validation
   const twilioSignature = req.headers['x-twilio-signature'] ?? '';
   const fullUrl = `https://stream.yaub.ai${req.url}`;
   const isValid = validateRequest(TWILIO_AUTH_TOKEN, twilioSignature, fullUrl, {});
-  // Twilio no manda x-twilio-signature en Media Streams WSS
-  // Validacion desactivada - usar IP allowlist en firewall como alternativa
-  if (false && !isValid) {
-    console.warn('[Security] MONITOR - firma invalida:', req.url);
-  }
+  if (false && !isValid) { console.warn('[Security] MONITOR - firma invalida:', req.url); }
   console.log('[Security] Firma Twilio validada OK');
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
+
   const url = new URL(req.url, 'http://localhost');
   const callSid = url.searchParams.get('call_sid') ?? '';
   const phoneParam = normalizePhone(url.searchParams.get('phone') ?? '');
@@ -196,8 +223,6 @@ wss.on('connection', (twilioWs, req) => {
   let pendingMark = false;
   let callFinalized = false;
   let recordingSid = null;
-  _currentCallSid = callSid;
-  _currentSupabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
   const callStartTime = Date.now();
 
   let katuzSessionId = null;
@@ -264,15 +289,14 @@ wss.on('connection', (twilioWs, req) => {
         ended_at: new Date().toISOString(),
         duration_seconds: durationSeconds,
         outcome: outcome,
-        quality_score: finalScore,
-        sentiment: finalSentiment,
-        ai_analysis: { outcome: outcome, quality_score: finalScore, sentiment: finalSentiment, analysis: analysis },
+        quality_score: quality_score,
+        sentiment: sentiment,
+        ai_analysis: { outcome, quality_score, sentiment, analysis },
         ...(Object.keys(variables).length > 0 ? { outcome_variables: variables } : {}),
       }).eq('call_sid', resolvedCallSid);
 
       console.log(`[voice-stream] Llamada finalizada — outcome: ${outcome} variables: ${JSON.stringify(variables)}`);
 
-      // Descargar y subir grabacion si existe y duracion >= 20s
       if (recordingSid && durationSeconds >= 20) {
         setTimeout(async () => {
           try {
@@ -289,16 +313,11 @@ wss.on('connection', (twilioWs, req) => {
                 const { data: urlData } = supabase.storage.from('call-recordings').getPublicUrl(fileName);
                 await supabase.from('voice_calls').update({ recording_sid: recordingSid, recording_url: urlData?.publicUrl }).eq('call_sid', resolvedCallSid);
                 console.log(`[Recording] Subida exitosa: ${fileName}`);
-              } else {
-                console.error('[Recording] Error subiendo:', uploadError.message);
-              }
-            } else {
-              console.error('[Recording] Error descargando de Twilio:', audioRes.status, await audioRes.text());
-            }
+              } else { console.error('[Recording] Error subiendo:', uploadError.message); }
+            } else { console.error('[Recording] Error descargando de Twilio:', audioRes.status); }
           } catch(e) { console.error('[Recording] Error:', e.message); }
         }, 3000);
       }
-
     } catch (err) {
       console.error('[finalizeCall] Error:', err.message);
       await supabase.from('voice_calls').update({ status: 'completed', ended_at: new Date().toISOString(), duration_seconds: durationSeconds }).eq('call_sid', resolvedCallSid);
@@ -312,10 +331,7 @@ wss.on('connection', (twilioWs, req) => {
     if (twilioWs.readyState === WebSocket.OPEN) {
       fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${resolvedCallSid}.json`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Authorization': 'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64')
-        },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': 'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64') },
         body: 'Status=completed'
       }).then(() => console.log('[voice-stream] Llamada colgada via Twilio API'))
         .catch(err => console.error('[voice-stream] Error colgando:', err.message));
@@ -348,7 +364,6 @@ wss.on('connection', (twilioWs, req) => {
       const history = call?.transcript ?? [];
       const turnCount = (call?.turn_count ?? 0) + 1;
       const historyMessages = history.map(t => ({ role: t.role === 'user' ? 'user' : 'assistant', content: t.text }));
-
       if (signal?.aborted) return;
 
       const rawPrompt = va.assistants?.prompt ?? 'Eres un asistente útil.';
@@ -372,7 +387,6 @@ wss.on('connection', (twilioWs, req) => {
 
       const shouldHangup = aiReply.includes('[HANGUP]');
       const cleanReply = aiReply.replace('[HANGUP]', '').trim();
-
       console.log(`[AI] "${cleanReply}"${shouldHangup ? ' [COLGANDO]' : ''}`);
 
       katuzEmitTranscript('asesor', cleanReply);
@@ -391,10 +405,7 @@ wss.on('connection', (twilioWs, req) => {
       if (shouldHangup) {
         const despedidaMs = Math.max(4000, (ttsText.length / 15) * 1000);
         console.log(`[voice-stream] Esperando ${Math.round(despedidaMs/1000)}s antes de colgar...`);
-        setTimeout(() => {
-          console.log('[voice-stream] Colgando después de despedida...');
-          hangupCall();
-        }, despedidaMs);
+        setTimeout(() => { console.log('[voice-stream] Colgando después de despedida...'); hangupCall(); }, despedidaMs);
       }
     } catch (err) {
       if (err.name !== 'AbortError') console.error('[pipeline] Error:', err.message);
@@ -402,42 +413,50 @@ wss.on('connection', (twilioWs, req) => {
     }
   }
 
-  async function callOpenAIWithDynamicTools(model, messages, tools, integrations, signal) {
+  // ─── LLM con keyManager: round-robin Azure → OpenAI fallback ─────────────
+  async function callOpenAIWithDynamicTools(model, messages, tools, integrations, signal, retryCount = 0) {
     try {
       while (true) {
         if (signal?.aborted) return null;
-        const requestBody = { model, max_tokens: 180, messages };
+
+        const { key, endpoint, isAzure, onSuccess, onFailure } = keyManager.getLLMKey();
+        const apiUrl = isAzure
+          ? `${endpoint}/openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${AZURE_OPENAI_API_VERSION}`
+          : `${endpoint}/chat/completions`;
+        const apiHeaders = isAzure
+          ? { 'Content-Type': 'application/json', 'api-key': key }
+          : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` };
+
+        const requestBody = { max_tokens: 180, messages };
+        if (!isAzure) requestBody.model = model;
         if (tools.length > 0) { requestBody.tools = tools; requestBody.tool_choice = 'auto'; }
 
-        const useAzure = AZURE_OPENAI_KEY && AZURE_OPENAI_ENDPOINT;
-        const apiUrl = useAzure
-          ? `${AZURE_OPENAI_ENDPOINT}/openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${AZURE_OPENAI_API_VERSION}`
-          : 'https://api.openai.com/v1/chat/completions';
-        const apiHeaders = useAzure
-          ? { 'Content-Type': 'application/json', 'api-key': AZURE_OPENAI_KEY }
-          : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` };
-        const reqBody = useAzure ? { ...requestBody } : requestBody;
-        if (useAzure) delete reqBody.model;
+        let res, data;
+        res = await fetch(apiUrl, { method: 'POST', headers: apiHeaders, body: JSON.stringify(requestBody), signal });
+        data = await res.json();
 
-        let res, data, retries = 0;
-        while (retries < 3) {
-          res = await fetch(apiUrl, { method: 'POST', headers: apiHeaders, body: JSON.stringify(reqBody), signal });
-          data = await res.json();
-          if (res.status === 429 || res.status === 503) {
-            retries++;
-            console.warn(`[OpenAI] Rate limit/503, reintento ${retries}/3...`);
-            await new Promise(r => setTimeout(r, 9000));
-            continue;
+        if (res.status === 429 || res.status === 503) {
+          onFailure(res.status);
+          if (retryCount < 2) {
+            console.warn(`[LLM] Rate limit/503 (${res.status}), rotando key (intento ${retryCount + 1}/2)...`);
+            await new Promise(r => setTimeout(r, 1500));
+            return callOpenAIWithDynamicTools(model, messages, tools, integrations, signal, retryCount + 1);
           }
-          break;
+          return 'Lo siento, ocurrió un error.';
         }
-        if (!res.ok || data.error) { console.error('[OpenAI] API error:', JSON.stringify(data.error ?? data)); return 'Lo siento, ocurrió un error.'; }
 
+        if (!res.ok || data.error) {
+          onFailure(res.status);
+          console.error('[LLM] API error:', JSON.stringify(data.error ?? data));
+          return 'Lo siento, ocurrió un error.';
+        }
+
+        onSuccess();
         const msg = data.choices?.[0]?.message;
-        if (!msg) { console.error('[OpenAI] msg null, choices:', JSON.stringify(data.choices)); return 'Lo siento, ocurrió un error.'; }
+        if (!msg) { console.error('[LLM] msg null, choices:', JSON.stringify(data.choices)); return 'Lo siento, ocurrió un error.'; }
         if (!msg.tool_calls || msg.tool_calls.length === 0) return msg.content?.trim() ?? 'Lo siento, ocurrió un error.';
 
-        console.log(`[function-calling] OpenAI solicitó ${msg.tool_calls.length} tool(s)`);
+        console.log(`[function-calling] LLM solicitó ${msg.tool_calls.length} tool(s)`);
         messages.push(msg);
         for (const toolCall of msg.tool_calls) {
           if (signal?.aborted) return null;
@@ -450,14 +469,13 @@ wss.on('connection', (twilioWs, req) => {
       }
     } catch (err) {
       if (err.name === 'AbortError') return null;
-      console.error('[OpenAI tools] Exception:', err.message);
+      console.error('[LLM tools] Exception:', err.message);
       return 'Lo siento, ocurrió un error.';
     }
   }
 
   function connectDeepgram() {
-    const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({ model: 'nova-2', language: 'es', encoding: 'mulaw', sample_rate: '8000', channels: '1', interim_results: 'true', endpointing: '400' }).toString();
-    deepgramWs = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
+    deepgramWs = createDeepgramConnection();
     deepgramWs.on('open', () => { console.log('[Deepgram] Conectado'); isDeepgramReady = true; for (const chunk of audioBuffer) deepgramWs.send(Buffer.from(chunk, 'base64')); audioBuffer = []; });
     deepgramWs.on('message', async (data) => {
       const msg = JSON.parse(data.toString());
@@ -496,22 +514,14 @@ wss.on('connection', (twilioWs, req) => {
       if (params.from) callerPhone = normalizePhone(params.from);
       console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} to="${resolvedPhone}" from="${callerPhone}"`);
 
-      // Iniciar grabacion inmediatamente cuando comienza la llamada
       fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${resolvedCallSid}/Recordings.json`, {
         method: 'POST',
-        headers: {
-          'Authorization': 'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'),
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
+        headers: { 'Authorization': 'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'RecordingChannels=dual'
       }).then(async (recRes) => {
         const recData = await recRes.json();
-        if (recData.sid) {
-          recordingSid = recData.sid;
-          console.log(`[Recording] Iniciada: ${recData.sid}`);
-        } else {
-          console.error('[Recording] Error iniciando:', JSON.stringify(recData));
-        }
+        if (recData.sid) { recordingSid = recData.sid; console.log(`[Recording] Iniciada: ${recData.sid}`); }
+        else { console.error('[Recording] Error iniciando:', JSON.stringify(recData)); }
       }).catch(e => console.error('[Recording] fetch error:', e.message));
 
       loadAssistant(resolvedPhone).then(() => {
@@ -535,12 +545,24 @@ wss.on('connection', (twilioWs, req) => {
   twilioWs.on('close', () => { console.log('[Twilio WS] Cerrado'); interruptSpeaking(); deepgramWs?.close(); finalizeCall(); });
 });
 
-server.listen(PORT, '0.0.0.0', () => { console.log(`[voice-stream] Listening on port ${PORT}`); });
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[voice-stream] Listening on port ${PORT}`);
+  console.log(`[KeyManager] Estado inicial:`, JSON.stringify(keyManager.getStatus(), null, 2));
+});
+
+// ─── TTS providers ────────────────────────────────────────────────────────────
 
 async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_5', streamSid, twilioWs, signal) {
+  const { key, onSuccess, onFailure } = keyManager.getElevenLabsKey();
   try {
-    const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`, { method: 'POST', headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify({ text, model_id: model, voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true } }), signal });
-    if (!res.ok) { console.error(`[ElevenLabs] Error ${res.status}:`, await res.text()); return; }
+    const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`, {
+      method: 'POST',
+      headers: { 'xi-api-key': key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, model_id: model, voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true } }),
+      signal
+    });
+    if (!res.ok) { onFailure(res.status); console.error(`[ElevenLabs] Error ${res.status}:`, await res.text()); return; }
+    onSuccess();
     const reader = res.body.getReader();
     let leftover = Buffer.alloc(0);
     const chunkSize = 640;
@@ -563,10 +585,17 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
 }
 
 async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', streamSid, twilioWs, signal) {
+  const { key, onSuccess, onFailure } = keyManager.getLLMKey();
   try {
     console.log(`[OpenAI TTS] voz=${voice} modelo=${model}`);
-    const res = await fetch('https://api.openai.com/v1/audio/speech', { method: 'POST', headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model, input: text, voice, response_format: 'mp3', speed: 1.0 }), signal });
-    if (!res.ok) { console.error(`[OpenAI TTS] Error ${res.status}:`, await res.text()); return; }
+    const res = await fetch('https://api.openai.com/v1/audio/speech', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, input: text, voice, response_format: 'mp3', speed: 1.0 }),
+      signal
+    });
+    if (!res.ok) { onFailure(res.status); console.error(`[OpenAI TTS] Error ${res.status}:`, await res.text()); return; }
+    onSuccess();
     if (signal?.aborted) return;
     const mp3Buffer = Buffer.from(await res.arrayBuffer());
     if (signal?.aborted) return;
@@ -582,12 +611,19 @@ async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', s
 }
 
 async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', languageCode = 'es-US', streamSid, twilioWs, signal) {
+  const { key: googleKey, onSuccess, onFailure } = keyManager.getGoogleKey();
   try {
     console.log(`[Google TTS] voz=${voice} idioma=${languageCode}`);
     const accessToken = await getGoogleAccessToken();
     if (signal?.aborted) return;
-    const res = await fetch('https://texttospeech.googleapis.com/v1/text:synthesize', { method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ input: { text }, voice: { languageCode, name: voice }, audioConfig: { audioEncoding: 'MP3', speakingRate: 1.0 } }), signal });
-    if (!res.ok) { console.error(`[Google TTS] Error ${res.status}:`, await res.text()); return; }
+    const res = await fetch('https://texttospeech.googleapis.com/v1/text:synthesize', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { text }, voice: { languageCode, name: voice }, audioConfig: { audioEncoding: 'MP3', speakingRate: 1.0 } }),
+      signal
+    });
+    if (!res.ok) { onFailure(res.status); console.error(`[Google TTS] Error ${res.status}:`, await res.text()); return; }
+    onSuccess();
     if (signal?.aborted) return;
     const data = await res.json();
     const mp3Buffer = Buffer.from(data.audioContent, 'base64');
