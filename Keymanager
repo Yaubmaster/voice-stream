@@ -1,0 +1,191 @@
+// keyManager.js — Yaub Platform
+// Round-robin + failover automático para Deepgram, Azure OpenAI, Google TTS, ElevenLabs
+// Cada proveedor tiene su pool de keys. Si una falla (429/5xx) rota a la siguiente.
+
+class KeyPool {
+  constructor(name, keys) {
+    this.name = name;
+    this.keys = keys.filter(Boolean); // ignora keys vacías/undefined
+    this.index = 0;
+    this.failures = {}; // key -> { count, cooldownUntil }
+
+    if (this.keys.length === 0) {
+      console.warn(`[KeyManager] WARN: pool "${name}" tiene 0 keys configuradas`);
+    }
+  }
+
+  // Obtiene la siguiente key disponible (round-robin, saltando las en cooldown)
+  getKey() {
+    const now = Date.now();
+    const total = this.keys.length;
+
+    for (let i = 0; i < total; i++) {
+      const candidate = this.keys[(this.index + i) % total];
+      const failure = this.failures[candidate];
+
+      if (!failure || now > failure.cooldownUntil) {
+        this.index = (this.index + i + 1) % total;
+        return candidate;
+      }
+    }
+
+    // Todas en cooldown — forzar la menos mala (menor cooldown restante)
+    console.error(`[KeyManager] CRIT: todas las keys de "${this.name}" en cooldown, forzando rotación`);
+    const key = this.keys[this.index % total];
+    this.index = (this.index + 1) % total;
+    return key;
+  }
+
+  // Reportar fallo en una key específica
+  reportFailure(key, statusCode) {
+    if (!this.failures[key]) this.failures[key] = { count: 0, cooldownUntil: 0 };
+    this.failures[key].count++;
+
+    // Cooldown exponencial: 30s, 60s, 120s, máximo 300s
+    const cooldownMs = Math.min(30000 * Math.pow(2, this.failures[key].count - 1), 300000);
+    this.failures[key].cooldownUntil = Date.now() + cooldownMs;
+
+    console.warn(`[KeyManager] Key fallida en "${this.name}" (status ${statusCode}). ` +
+      `Fallo #${this.failures[key].count}. Cooldown: ${cooldownMs / 1000}s`);
+  }
+
+  // Reportar éxito — resetea contador de fallos
+  reportSuccess(key) {
+    if (this.failures[key]) {
+      delete this.failures[key];
+    }
+  }
+
+  // Estado del pool para monitoreo
+  getStatus() {
+    const now = Date.now();
+    return {
+      name: this.name,
+      total: this.keys.length,
+      available: this.keys.filter(k => !this.failures[k] || now > this.failures[k].cooldownUntil).length,
+      failures: Object.entries(this.failures).map(([k, v]) => ({
+        key: k.slice(0, 8) + '...', // no loggear key completa
+        count: v.count,
+        cooldownRemaining: Math.max(0, Math.round((v.cooldownUntil - now) / 1000)) + 's'
+      }))
+    };
+  }
+}
+
+// ─── Inicialización de pools desde .env ───────────────────────────────────────
+// En .env puedes poner múltiples keys separadas por coma:
+//   DEEPGRAM_API_KEYS=key1,key2,key3
+//   AZURE_OPENAI_KEYS=key1,key2
+//   etc.
+
+function parseKeys(envVar) {
+  const raw = process.env[envVar] || '';
+  return raw.split(',').map(k => k.trim()).filter(Boolean);
+}
+
+const pools = {
+  deepgram: new KeyPool('Deepgram', parseKeys('DEEPGRAM_API_KEYS')),
+  azure:    new KeyPool('Azure OpenAI', parseKeys('AZURE_OPENAI_KEYS')),
+  openai:   new KeyPool('OpenAI fallback', parseKeys('OPENAI_API_KEYS')),   // fallback si Azure falla
+  google:   new KeyPool('Google TTS', parseKeys('GOOGLE_TTS_KEYS')),
+  elevenlabs: new KeyPool('ElevenLabs', parseKeys('ELEVENLABS_API_KEYS')),
+};
+
+// ─── API pública ───────────────────────────────────────────────────────────────
+
+const keyManager = {
+
+  // Obtener key de cualquier pool
+  getKey(provider) {
+    if (!pools[provider]) throw new Error(`[KeyManager] Provider desconocido: ${provider}`);
+    return pools[provider].getKey();
+  },
+
+  // Reportar fallo — llamar cuando el proveedor responde 429, 5xx
+  reportFailure(provider, key, statusCode) {
+    if (!pools[provider]) return;
+    pools[provider].reportFailure(key, statusCode);
+  },
+
+  // Reportar éxito — llamar en el happy path para limpiar fallos
+  reportSuccess(provider, key) {
+    if (!pools[provider]) return;
+    pools[provider].reportSuccess(key);
+  },
+
+  // Para Deepgram específicamente — retorna key con fallback automático
+  // Uso: const { key, onSuccess, onFailure } = keyManager.getDeepgramKey()
+  getDeepgramKey() {
+    const key = pools.deepgram.getKey();
+    return {
+      key,
+      onSuccess: () => keyManager.reportSuccess('deepgram', key),
+      onFailure: (status) => keyManager.reportFailure('deepgram', key, status),
+    };
+  },
+
+  // Para Azure con fallback automático a OpenAI directo
+  // Retorna: { key, endpoint, isAzure, onSuccess, onFailure }
+  getLLMKey() {
+    const azureAvailable = pools.azure.keys.length > 0;
+    const openaiAvailable = pools.openai.keys.length > 0;
+
+    if (azureAvailable) {
+      const key = pools.azure.getKey();
+      return {
+        key,
+        endpoint: process.env.AZURE_OPENAI_ENDPOINT,
+        isAzure: true,
+        onSuccess: () => keyManager.reportSuccess('azure', key),
+        onFailure: (status) => {
+          keyManager.reportFailure('azure', key, status);
+          // Si Azure falla y tenemos OpenAI, loggear para que el caller reintente
+          if (openaiAvailable) {
+            console.warn('[KeyManager] Azure falló, fallback a OpenAI directo disponible');
+          }
+        },
+      };
+    }
+
+    if (openaiAvailable) {
+      const key = pools.openai.getKey();
+      console.warn('[KeyManager] Usando OpenAI directo (Azure no configurado o agotado)');
+      return {
+        key,
+        endpoint: 'https://api.openai.com/v1',
+        isAzure: false,
+        onSuccess: () => keyManager.reportSuccess('openai', key),
+        onFailure: (status) => keyManager.reportFailure('openai', key, status),
+      };
+    }
+
+    throw new Error('[KeyManager] CRIT: sin keys LLM disponibles (Azure ni OpenAI)');
+  },
+
+  // Para Google TTS
+  getGoogleKey() {
+    const key = pools.google.getKey();
+    return {
+      key,
+      onSuccess: () => keyManager.reportSuccess('google', key),
+      onFailure: (status) => keyManager.reportFailure('google', key, status),
+    };
+  },
+
+  // Para ElevenLabs
+  getElevenLabsKey() {
+    const key = pools.elevenlabs.getKey();
+    return {
+      key,
+      onSuccess: () => keyManager.reportSuccess('elevenlabs', key),
+      onFailure: (status) => keyManager.reportFailure('elevenlabs', key, status),
+    };
+  },
+
+  // Status de todos los pools — útil para endpoint /health
+  getStatus() {
+    return Object.values(pools).map(p => p.getStatus());
+  },
+};
+
+module.exports = keyManager;
