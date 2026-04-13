@@ -22,6 +22,53 @@ const KATUZ_ENGINE_URL = `${SUPABASE_URL}/functions/v1/katuz-engine`;
 let googleAccessToken = null;
 let googleTokenExpiry = 0;
 
+// ─── Self-service limit enforcement ──────────────────────────────────────────
+const activeCalls = new Map(); // tenantId -> Set of callSids
+
+function trackCallStart(tenantId, callSid) {
+  if (!tenantId) return;
+  if (!activeCalls.has(tenantId)) activeCalls.set(tenantId, new Set());
+  activeCalls.get(tenantId).add(callSid);
+}
+
+function trackCallEnd(tenantId, callSid) {
+  if (!tenantId || !activeCalls.has(tenantId)) return;
+  activeCalls.get(tenantId).delete(callSid);
+  if (activeCalls.get(tenantId).size === 0) activeCalls.delete(tenantId);
+}
+
+function getActiveCalls(tenantId) {
+  return activeCalls.has(tenantId) ? activeCalls.get(tenantId).size : 0;
+}
+
+async function checkTenantLimits(supabaseClient, tenantId) {
+  try {
+    const { data, error } = await supabaseClient.rpc('check_voice_limits', { p_tenant_id: tenantId });
+    if (error) {
+      console.error('[limits] RPC error:', error.message);
+      return { allowed: true, reason: 'error_fallback', max_duration_seconds: 0, max_concurrent: 999, minutes_remaining: 999 };
+    }
+    if (data && data.length > 0) return data[0];
+    // No subscription = legacy/enterprise client, allow
+    return { allowed: true, reason: 'no_subscription', max_duration_seconds: 0, max_concurrent: 999, minutes_remaining: 999 };
+  } catch (err) {
+    console.error('[limits] Exception:', err.message);
+    return { allowed: true, reason: 'exception_fallback', max_duration_seconds: 0, max_concurrent: 999, minutes_remaining: 999 };
+  }
+}
+
+async function reportVoiceUsage(supabaseClient, tenantId, durationSeconds) {
+  if (!tenantId || durationSeconds <= 0) return;
+  const minutesUsed = Math.ceil(durationSeconds / 60);
+  try {
+    await supabaseClient.rpc('increment_voice_usage', { p_tenant_id: tenantId, p_minutes: minutesUsed });
+    console.log(`[usage] Reported ${minutesUsed}min for tenant=${tenantId}`);
+  } catch (err) {
+    console.error(`[usage] Error reporting: ${err.message}`);
+  }
+}
+// ─── End limit enforcement ───────────────────────────────────────────────────
+
 async function getGoogleAccessToken() {
   if (googleAccessToken && Date.now() < googleTokenExpiry - 60000) return googleAccessToken;
   const keyFile = JSON.parse(fs.readFileSync(GOOGLE_TTS_KEY_PATH, 'utf8'));
@@ -48,7 +95,7 @@ async function getGoogleAccessToken() {
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', uptime: Math.round(process.uptime()), keys: keyManager.getStatus() }));
+    res.end(JSON.stringify({ status: 'ok', uptime: Math.round(process.uptime()), keys: keyManager.getStatus(), activeTenants: activeCalls.size }));
     return;
   }
   res.writeHead(200);
@@ -153,7 +200,6 @@ Responde SOLO con JSON válido sin markdown:
   "variables": {${outcomeVariables?.map(v => `"${v.key}": null`).join(', ')}}` : ''}
 }${variableInstructions}`;
 
-  // Usar keyManager para inferCallOutcome — fallback a OpenAI directo si Azure falla
   const { key, endpoint, isAzure, onSuccess, onFailure } = keyManager.getLLMKey();
   const apiUrl = isAzure
     ? `${endpoint}/openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${AZURE_OPENAI_API_VERSION}`
@@ -225,17 +271,23 @@ wss.on('connection', (twilioWs, req) => {
   let recordingSid = null;
   const callStartTime = Date.now();
 
+  // ─── Limit enforcement state (per-connection) ─────────
+  let tenantId = null;
+  let callLimits = null;
+  let maxDurationTimer = null;
+  // ───────────────────────────────────────────────────────
+
   let katuzSessionId = null;
   let katuzEnabled = false;
   let katuzTurnCount = 0;
   let katuzTenantId = null;
 
-  async function katuzCreateSession(voiceCallId, tenantId, assistantId) {
+  async function katuzCreateSession(voiceCallId, tId, assistantId) {
     try {
-      const { data, error } = await supabase.from('katuz_sessions').insert({ call_sid: resolvedCallSid, voice_call_id: voiceCallId ?? null, tenant_id: tenantId, assistant_id: assistantId ?? null, phone_from: callerPhone || resolvedPhone, status: 'active', started_at: new Date().toISOString() }).select('id').single();
+      const { data, error } = await supabase.from('katuz_sessions').insert({ call_sid: resolvedCallSid, voice_call_id: voiceCallId ?? null, tenant_id: tId, assistant_id: assistantId ?? null, phone_from: callerPhone || resolvedPhone, status: 'active', started_at: new Date().toISOString() }).select('id').single();
       if (error) { console.error('[Katuz] Error creando sesión:', error.message); return; }
-      katuzSessionId = data.id; katuzEnabled = true; katuzTenantId = tenantId;
-      console.log(`[Katuz] Sesión creada: ${katuzSessionId} tenant: ${tenantId}`);
+      katuzSessionId = data.id; katuzEnabled = true; katuzTenantId = tId;
+      console.log(`[Katuz] Sesión creada: ${katuzSessionId} tenant: ${tId}`);
     } catch (err) { console.error('[Katuz] katuzCreateSession error:', err.message); }
   }
 
@@ -276,6 +328,14 @@ wss.on('connection', (twilioWs, req) => {
     callFinalized = true;
     const durationSeconds = Math.round((Date.now() - callStartTime) / 1000);
     console.log(`[voice-stream] Finalizando llamada — duración: ${durationSeconds}s`);
+
+    // ─── Clear max duration timer ────────────────────────
+    if (maxDurationTimer) { clearTimeout(maxDurationTimer); maxDurationTimer = null; }
+
+    // ─── Track call end + report usage ───────────────────
+    trackCallEnd(tenantId, resolvedCallSid);
+    reportVoiceUsage(supabase, tenantId, durationSeconds);
+    // ─────────────────────────────────────────────────────
 
     try {
       const { data: callData } = await supabase.from('voice_calls').select('transcript').eq('call_sid', resolvedCallSid).single();
@@ -343,7 +403,10 @@ wss.on('connection', (twilioWs, req) => {
     return supabase.from('voice_assistants').select('*, assistants(id, name, prompt, llm_model, tenant_id, dashboard_type, outcome_variables)').eq('twilio_phone_number', phone).eq('is_active', true).single()
       .then(({ data, error }) => {
         va = data;
-        console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} tipo: ${va?.assistants?.dashboard_type ?? 'atencion'} integraciones: ${va?.integrations?.length ?? 0} error: ${error?.message ?? 'none'}`);
+        // ─── Capture tenantId for limit enforcement ──────
+        tenantId = va?.assistants?.tenant_id ?? null;
+        // ─────────────────────────────────────────────────
+        console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} tenant: ${tenantId} tipo: ${va?.assistants?.dashboard_type ?? 'atencion'} integraciones: ${va?.integrations?.length ?? 0} error: ${error?.message ?? 'none'}`);
         if (va?.katuz_enabled && va?.assistants?.tenant_id) {
           supabase.from('voice_calls').select('id').eq('call_sid', resolvedCallSid).single()
             .then(({ data: callData }) => { katuzCreateSession(callData?.id, va.assistants.tenant_id, va.assistants.id); });
@@ -524,7 +587,60 @@ wss.on('connection', (twilioWs, req) => {
         else { console.error('[Recording] Error iniciando:', JSON.stringify(recData)); }
       }).catch(e => console.error('[Recording] fetch error:', e.message));
 
-      loadAssistant(resolvedPhone).then(() => {
+      loadAssistant(resolvedPhone).then(async () => {
+        // ─── LIMIT ENFORCEMENT: check after assistant loads ──
+        if (tenantId) {
+          callLimits = await checkTenantLimits(supabase, tenantId);
+
+          if (!callLimits.allowed) {
+            console.log(`[limits] BLOCKED tenant=${tenantId} reason=${callLimits.reason}`);
+            // Play a short message then hang up
+            if (va) {
+              isSpeaking = true;
+              pendingMark = true;
+              await streamTTSToTwilio('Lo siento, el servicio no está disponible en este momento. Por favor intenta más tarde.', va, streamSid, twilioWs, null);
+            }
+            setTimeout(() => hangupCall(), 4000);
+            return;
+          }
+
+          // Check concurrent calls
+          const currentActive = getActiveCalls(tenantId);
+          if (callLimits.max_concurrent > 0 && callLimits.max_concurrent < 999 && currentActive >= callLimits.max_concurrent) {
+            console.log(`[limits] CONCURRENT LIMIT tenant=${tenantId} active=${currentActive} max=${callLimits.max_concurrent}`);
+            if (va) {
+              isSpeaking = true;
+              pendingMark = true;
+              await streamTTSToTwilio('Todas nuestras líneas están ocupadas en este momento. Por favor intenta en unos minutos.', va, streamSid, twilioWs, null);
+            }
+            setTimeout(() => hangupCall(), 4000);
+            return;
+          }
+
+          // Track this call
+          trackCallStart(tenantId, resolvedCallSid);
+
+          // Set max duration timer (0 = unlimited for enterprise)
+          if (callLimits.max_duration_seconds > 0) {
+            const warningAt = Math.max(0, callLimits.max_duration_seconds - 15) * 1000;
+            // Warning 15s before cutoff
+            setTimeout(async () => {
+              if (callFinalized) return;
+              console.log(`[limits] WARNING: 15s remaining for tenant=${tenantId}`);
+              // Inject a system-level nudge on next turn — the bot will wrap up naturally
+            }, warningAt);
+
+            maxDurationTimer = setTimeout(() => {
+              if (callFinalized) return;
+              console.log(`[limits] MAX DURATION reached tenant=${tenantId} limit=${callLimits.max_duration_seconds}s — hanging up`);
+              hangupCall();
+            }, callLimits.max_duration_seconds * 1000);
+          }
+
+          console.log(`[limits] OK tenant=${tenantId} maxDur=${callLimits.max_duration_seconds}s concurrent=${currentActive + 1}/${callLimits.max_concurrent} remaining=${Math.round(callLimits.minutes_remaining)}min`);
+        }
+        // ─── END LIMIT ENFORCEMENT ───────────────────────────
+
         setTimeout(async () => {
           if (!va) { console.error('[voice-stream] va sigue null después de cargar'); return; }
           const greeting = va.greeting;
