@@ -13,6 +13,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GOOGLE_TTS_KEY_PATH = process.env.GOOGLE_TTS_KEY_PATH;
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const twilioClient = require('twilio')(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT;
 const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT;
 const AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION;
@@ -118,7 +119,7 @@ function convertMp3ToMulaw(inputBuffer) {
     const chunks = [];
     ffmpeg.stdout.on('data', chunk => chunks.push(chunk));
     ffmpeg.stdout.on('end', () => resolve(Buffer.concat(chunks)));
-    ffmpeg.stderr.on('data', () => {});
+    ffmpeg.stderr.on('data', () => { });
     ffmpeg.on('error', reject);
     ffmpeg.stdin.write(inputBuffer);
     ffmpeg.stdin.end();
@@ -165,7 +166,7 @@ async function callDynamicIntegration(integration, params, callSid = null, supab
       supabaseClient.from('voice_calls').update({
         funnel_stage: cobertura,
         outcome_variables: { cobertura_positiva: data?.success === true, cobertura_negativa: data?.success !== true }
-      }).eq('call_sid', callSid).then(() => {});
+      }).eq('call_sid', callSid).then(() => { });
       console.log(`[cobertura] funnel_stage=${cobertura} callSid=${callSid}`);
     }
     return { result: data, interpretation_guide: integration.response_mapping ?? '' };
@@ -375,7 +376,7 @@ wss.on('connection', (twilioWs, req) => {
                 console.log(`[Recording] Subida exitosa: ${fileName}`);
               } else { console.error('[Recording] Error subiendo:', uploadError.message); }
             } else { console.error('[Recording] Error descargando de Twilio:', audioRes.status); }
-          } catch(e) { console.error('[Recording] Error:', e.message); }
+          } catch (e) { console.error('[Recording] Error:', e.message); }
         }, 3000);
       }
     } catch (err) {
@@ -458,7 +459,7 @@ wss.on('connection', (twilioWs, req) => {
       const ttsText = trimForTTS(cleanReply, 250);
 
       history.push({ role: 'user', text: transcript, ts: new Date().toISOString() }, { role: 'assistant', text: cleanReply, ts: new Date().toISOString() });
-      supabase.from('voice_calls').update({ transcript: history, turn_count: turnCount, last_activity_at: new Date().toISOString() }).eq('call_sid', resolvedCallSid).then(() => {});
+      supabase.from('voice_calls').update({ transcript: history, turn_count: turnCount, last_activity_at: new Date().toISOString() }).eq('call_sid', resolvedCallSid).then(() => { });
 
       if (signal?.aborted) return;
       pendingMark = true;
@@ -467,7 +468,7 @@ wss.on('connection', (twilioWs, req) => {
 
       if (shouldHangup) {
         const despedidaMs = Math.max(4000, (ttsText.length / 15) * 1000);
-        console.log(`[voice-stream] Esperando ${Math.round(despedidaMs/1000)}s antes de colgar...`);
+        console.log(`[voice-stream] Esperando ${Math.round(despedidaMs / 1000)}s antes de colgar...`);
         setTimeout(() => { console.log('[voice-stream] Colgando después de despedida...'); hangupCall(); }, despedidaMs);
       }
     } catch (err) {
