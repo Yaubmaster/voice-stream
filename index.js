@@ -7,6 +7,10 @@ const fs = require('fs');
 const { validateRequest } = require('twilio');
 const keyManager = require('./keyManager');
 
+// ─── NEW: Ambient noise mixer ────────────────────────────────────────────────
+const ambientMixer = require('./ambientMixer');
+// ─────────────────────────────────────────────────────────────────────────────
+
 const PORT = process.env.PORT || 8080;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -17,31 +21,32 @@ const twilioClient = require('twilio')(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT;
 const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT;
 const AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION;
-
 const KATUZ_ENGINE_URL = `${SUPABASE_URL}/functions/v1/katuz-engine`;
+
+// ─── NEW: Load ambient noise library at startup ──────────────────────────────
+// Default location: ./ambient/  (override with AMBIENT_AUDIO_DIR env var)
+const AMBIENT_AUDIO_DIR = process.env.AMBIENT_AUDIO_DIR || null;
+ambientMixer.loadAmbientLibrary(AMBIENT_AUDIO_DIR);
+// ─────────────────────────────────────────────────────────────────────────────
 
 let googleAccessToken = null;
 let googleTokenExpiry = 0;
 
 // ─── Self-service limit enforcement ──────────────────────────────────────────
-const activeCalls = new Map(); // tenantId -> Set of callSids
-
+const activeCalls = new Map();
 function trackCallStart(tenantId, callSid) {
   if (!tenantId) return;
   if (!activeCalls.has(tenantId)) activeCalls.set(tenantId, new Set());
   activeCalls.get(tenantId).add(callSid);
 }
-
 function trackCallEnd(tenantId, callSid) {
   if (!tenantId || !activeCalls.has(tenantId)) return;
   activeCalls.get(tenantId).delete(callSid);
   if (activeCalls.get(tenantId).size === 0) activeCalls.delete(tenantId);
 }
-
 function getActiveCalls(tenantId) {
   return activeCalls.has(tenantId) ? activeCalls.get(tenantId).size : 0;
 }
-
 async function checkTenantLimits(supabaseClient, tenantId) {
   try {
     const { data, error } = await supabaseClient.rpc('check_voice_limits', { p_tenant_id: tenantId });
@@ -50,14 +55,12 @@ async function checkTenantLimits(supabaseClient, tenantId) {
       return { allowed: true, reason: 'error_fallback', max_duration_seconds: 0, max_concurrent: 999, minutes_remaining: 999 };
     }
     if (data && data.length > 0) return data[0];
-    // No subscription = legacy/enterprise client, allow
     return { allowed: true, reason: 'no_subscription', max_duration_seconds: 0, max_concurrent: 999, minutes_remaining: 999 };
   } catch (err) {
     console.error('[limits] Exception:', err.message);
     return { allowed: true, reason: 'exception_fallback', max_duration_seconds: 0, max_concurrent: 999, minutes_remaining: 999 };
   }
 }
-
 async function reportVoiceUsage(supabaseClient, tenantId, durationSeconds) {
   if (!tenantId || durationSeconds <= 0) return;
   const minutesUsed = Math.ceil(durationSeconds / 60);
@@ -68,7 +71,6 @@ async function reportVoiceUsage(supabaseClient, tenantId, durationSeconds) {
     console.error(`[usage] Error reporting: ${err.message}`);
   }
 }
-// ─── End limit enforcement ───────────────────────────────────────────────────
 
 async function getGoogleAccessToken() {
   if (googleAccessToken && Date.now() < googleTokenExpiry - 60000) return googleAccessToken;
@@ -92,11 +94,16 @@ async function getGoogleAccessToken() {
   return googleAccessToken;
 }
 
-// ─── HTTP server + health endpoint ───────────────────────────────────────────
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', uptime: Math.round(process.uptime()), keys: keyManager.getStatus(), activeTenants: activeCalls.size }));
+    res.end(JSON.stringify({
+      status: 'ok',
+      uptime: Math.round(process.uptime()),
+      keys: keyManager.getStatus(),
+      activeTenants: activeCalls.size,
+      ambient: ambientMixer.getStatus(), // NEW: visibility en /health
+    }));
     return;
   }
   res.writeHead(200);
@@ -126,12 +133,13 @@ function convertMp3ToMulaw(inputBuffer) {
   });
 }
 
-async function streamTTSToTwilio(text, va, streamSid, twilioWs, signal) {
+// ─── MODIFIED: streamTTSToTwilio ahora pasa ambientState a los providers ─────
+async function streamTTSToTwilio(text, va, streamSid, twilioWs, signal, ambientState) {
   const provider = va.tts_provider ?? 'elevenlabs';
-  console.log(`[TTS] Proveedor: ${provider}`);
-  if (provider === 'openai') await streamOpenAITTSToTwilio(text, va.openai_voice ?? 'alloy', va.openai_tts_model ?? 'tts-1', streamSid, twilioWs, signal);
-  else if (provider === 'google') await streamGoogleTTSToTwilio(text, va.google_tts_voice ?? 'es-US-Wavenet-B', va.google_tts_language ?? 'es-US', streamSid, twilioWs, signal);
-  else await streamElevenLabsToTwilio(text, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs, signal);
+  console.log(`[TTS] Proveedor: ${provider}${ambientState ? ` ambient=${ambientState.type}@${(ambientState.volume * 100).toFixed(0)}%` : ''}`);
+  if (provider === 'openai') await streamOpenAITTSToTwilio(text, va.openai_voice ?? 'alloy', va.openai_tts_model ?? 'tts-1', streamSid, twilioWs, signal, ambientState);
+  else if (provider === 'google') await streamGoogleTTSToTwilio(text, va.google_tts_voice ?? 'es-US-Wavenet-B', va.google_tts_language ?? 'es-US', streamSid, twilioWs, signal, ambientState);
+  else await streamElevenLabsToTwilio(text, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs, signal, ambientState);
 }
 
 function buildToolsFromIntegrations(integrations) {
@@ -200,7 +208,6 @@ Responde SOLO con JSON válido sin markdown:
   "analysis": "<parrafo de 2-3 oraciones describiendo que paso en la llamada, que queria el cliente y como respondio el asistente>"${outcomeVariables?.length > 0 ? `,
   "variables": {${outcomeVariables?.map(v => `"${v.key}": null`).join(', ')}}` : ''}
 }${variableInstructions}`;
-
   const { key, endpoint, isAzure, onSuccess, onFailure } = keyManager.getLLMKey();
   const apiUrl = isAzure
     ? `${endpoint}/openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${AZURE_OPENAI_API_VERSION}`
@@ -210,7 +217,6 @@ Responde SOLO con JSON válido sin markdown:
     : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` };
   const reqBody = { max_tokens: 200, temperature: 0.1, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: lastTurns }] };
   if (!isAzure) reqBody.model = 'gpt-4o-mini';
-
   try {
     const res = await fetch(apiUrl, { method: 'POST', headers: apiHeaders, body: JSON.stringify(reqBody) });
     if (!res.ok) { onFailure(res.status); throw new Error(`LLM ${res.status}`); }
@@ -226,7 +232,6 @@ Responde SOLO con JSON válido sin markdown:
   }
 }
 
-// ─── Deepgram connection usando keyManager ────────────────────────────────────
 function createDeepgramConnection() {
   const { key, onSuccess, onFailure } = keyManager.getDeepgramKey();
   const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
@@ -250,13 +255,11 @@ wss.on('connection', (twilioWs, req) => {
   if (false && !isValid) { console.warn('[Security] MONITOR - firma invalida:', req.url); }
   console.log('[Security] Firma Twilio validada OK');
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
-
   const url = new URL(req.url, 'http://localhost');
   const callSid = url.searchParams.get('call_sid') ?? '';
   const phoneParam = normalizePhone(url.searchParams.get('phone') ?? '');
   let callerPhone = normalizePhone(url.searchParams.get('from') ?? '');
   console.log(`[voice-stream] callSid=${callSid} to=${phoneParam} from=${callerPhone}`);
-
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
   let streamSid = '';
   let deepgramWs = null;
@@ -272,11 +275,14 @@ wss.on('connection', (twilioWs, req) => {
   let recordingSid = null;
   const callStartTime = Date.now();
 
-  // ─── Limit enforcement state (per-connection) ─────────
+  // ─── NEW: Per-call ambient state ───────────────────────────────────────────
+  // Se inicializa después de loadAssistant() cuando ya tenemos va.ambient_*
+  let ambientState = null;
+  // ───────────────────────────────────────────────────────────────────────────
+
   let tenantId = null;
   let callLimits = null;
   let maxDurationTimer = null;
-  // ───────────────────────────────────────────────────────
 
   let katuzSessionId = null;
   let katuzEnabled = false;
@@ -291,19 +297,16 @@ wss.on('connection', (twilioWs, req) => {
       console.log(`[Katuz] Sesión creada: ${katuzSessionId} tenant: ${tId}`);
     } catch (err) { console.error('[Katuz] katuzCreateSession error:', err.message); }
   }
-
   async function katuzEmitTranscript(speaker, text) {
     if (!katuzEnabled || !katuzSessionId) return;
     try {
       await supabase.from('katuz_events').insert({ session_id: katuzSessionId, tenant_id: katuzTenantId, event_type: 'transcript', speaker, content: text, ts_offset_ms: Date.now() - callStartTime, metadata: {} });
     } catch (err) { console.error('[Katuz] emit transcript error:', err.message); }
   }
-
   async function katuzAnalyze(speaker, text) {
     if (!katuzEnabled || !katuzSessionId) return;
     fetch(KATUZ_ENGINE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` }, body: JSON.stringify({ session_id: katuzSessionId, tenant_id: katuzTenantId, speaker, text, turn: katuzTurnCount, ts_offset_ms: Date.now() - callStartTime }) }).catch(err => console.error('[Katuz] analyze error:', err.message));
   }
-
   async function katuzFinalizeSession() {
     if (!katuzEnabled || !katuzSessionId) return;
     try {
@@ -329,22 +332,15 @@ wss.on('connection', (twilioWs, req) => {
     callFinalized = true;
     const durationSeconds = Math.round((Date.now() - callStartTime) / 1000);
     console.log(`[voice-stream] Finalizando llamada — duración: ${durationSeconds}s`);
-
-    // ─── Clear max duration timer ────────────────────────
     if (maxDurationTimer) { clearTimeout(maxDurationTimer); maxDurationTimer = null; }
-
-    // ─── Track call end + report usage ───────────────────
     trackCallEnd(tenantId, resolvedCallSid);
     reportVoiceUsage(supabase, tenantId, durationSeconds);
-    // ─────────────────────────────────────────────────────
-
     try {
       const { data: callData } = await supabase.from('voice_calls').select('transcript').eq('call_sid', resolvedCallSid).single();
       const transcript = callData?.transcript ?? [];
       const dashboardType = va?.assistants?.dashboard_type ?? 'atencion';
       const outcomeVariables = va?.assistants?.outcome_variables ?? [];
       const { outcome, variables, quality_score, sentiment, analysis } = await inferCallOutcome(transcript, dashboardType, outcomeVariables);
-
       await supabase.from('voice_calls').update({
         status: 'completed',
         ended_at: new Date().toISOString(),
@@ -355,9 +351,7 @@ wss.on('connection', (twilioWs, req) => {
         ai_analysis: { outcome, quality_score, sentiment, analysis },
         ...(Object.keys(variables).length > 0 ? { outcome_variables: variables } : {}),
       }).eq('call_sid', resolvedCallSid);
-
       console.log(`[voice-stream] Llamada finalizada — outcome: ${outcome} variables: ${JSON.stringify(variables)}`);
-
       if (recordingSid && durationSeconds >= 20) {
         setTimeout(async () => {
           try {
@@ -383,7 +377,6 @@ wss.on('connection', (twilioWs, req) => {
       console.error('[finalizeCall] Error:', err.message);
       await supabase.from('voice_calls').update({ status: 'completed', ended_at: new Date().toISOString(), duration_seconds: durationSeconds }).eq('call_sid', resolvedCallSid);
     }
-
     await katuzFinalizeSession();
   }
 
@@ -404,10 +397,25 @@ wss.on('connection', (twilioWs, req) => {
     return supabase.from('voice_assistants').select('*, assistants(id, name, prompt, llm_model, tenant_id, dashboard_type, outcome_variables)').eq('twilio_phone_number', phone).eq('is_active', true).single()
       .then(({ data, error }) => {
         va = data;
-        // ─── Capture tenantId for limit enforcement ──────
         tenantId = va?.assistants?.tenant_id ?? null;
-        // ─────────────────────────────────────────────────
         console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} tenant: ${tenantId} tipo: ${va?.assistants?.dashboard_type ?? 'atencion'} integraciones: ${va?.integrations?.length ?? 0} error: ${error?.message ?? 'none'}`);
+
+        // ─── NEW: Initialize ambient state if enabled for this assistant ─────
+        if (va?.ambient_noise_enabled === true) {
+          ambientState = ambientMixer.createAmbientState(
+            va.ambient_noise_type ?? 'call_center',
+            va.ambient_noise_volume ?? 0.08
+          );
+          if (ambientState) {
+            console.log(`[ambient] Activado para esta llamada: type=${ambientState.type} volume=${(ambientState.volume * 100).toFixed(1)}%`);
+          } else {
+            console.warn(`[ambient] Solicitado pero no disponible: type=${va.ambient_noise_type} (archivo no cargado?)`);
+          }
+        } else {
+          console.log('[ambient] Desactivado para este asistente');
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         if (va?.katuz_enabled && va?.assistants?.tenant_id) {
           supabase.from('voice_calls').select('id').eq('call_sid', resolvedCallSid).single()
             .then(({ data: callData }) => { katuzCreateSession(callData?.id, va.assistants.tenant_id, va.assistants.id); });
@@ -419,53 +427,43 @@ wss.on('connection', (twilioWs, req) => {
     try {
       if (!va) { console.error('[pipeline] va es null'); return; }
       if (signal?.aborted) return;
-
       katuzTurnCount++;
       katuzEmitTranscript('cliente', transcript);
       katuzAnalyze('cliente', transcript);
-
       const { data: call } = await supabase.from('voice_calls').select('transcript, turn_count').eq('call_sid', resolvedCallSid).single();
       const history = call?.transcript ?? [];
       const turnCount = (call?.turn_count ?? 0) + 1;
       const historyMessages = history.map(t => ({ role: t.role === 'user' ? 'user' : 'assistant', content: t.text }));
       if (signal?.aborted) return;
-
       const rawPrompt = va.assistants?.prompt ?? 'Eres un asistente útil.';
       const systemPrompt = rawPrompt
         .replace(/\{\{phone\}\}/g, callerPhone || 'desconocido')
         .replace(/\{\{call_sid\}\}/g, resolvedCallSid || '');
-
       const model = va.assistants?.llm_model ?? 'gpt-4o-mini';
       const integrations = va.integrations ?? [];
       const dynamicTools = buildToolsFromIntegrations(integrations);
       console.log(`[pipeline] caller=${callerPhone} tools: ${dynamicTools.map(t => t.function.name).join(', ') || 'ninguna'}`);
-
       const messages = [
         { role: 'system', content: systemPrompt + '\n\nIMPORTANTE: Responde de forma CORTA y NATURAL para una llamada telefónica. Máximo 2-3 oraciones cortas. Sin listas ni bullets.\n\nCuando la conversación haya terminado (el cliente se despidió, completó su objetivo o indicó que no necesita más ayuda), incluye la frase exacta: [HANGUP] al final de tu respuesta.' },
         ...historyMessages,
         { role: 'user', content: transcript },
       ];
-
       const aiReply = await callOpenAIWithDynamicTools(model, messages, dynamicTools, integrations, signal);
       if (!aiReply || signal?.aborted) return;
-
       const shouldHangup = aiReply.includes('[HANGUP]');
       const cleanReply = aiReply.replace('[HANGUP]', '').trim();
       console.log(`[AI] "${cleanReply}"${shouldHangup ? ' [COLGANDO]' : ''}`);
-
       katuzEmitTranscript('asesor', cleanReply);
       katuzAnalyze('asesor', cleanReply);
-
       const ttsText = trimForTTS(cleanReply, 250);
-
       history.push({ role: 'user', text: transcript, ts: new Date().toISOString() }, { role: 'assistant', text: cleanReply, ts: new Date().toISOString() });
       supabase.from('voice_calls').update({ transcript: history, turn_count: turnCount, last_activity_at: new Date().toISOString() }).eq('call_sid', resolvedCallSid).then(() => { });
-
       if (signal?.aborted) return;
       pendingMark = true;
-      await streamTTSToTwilio(ttsText, va, streamSid, twilioWs, signal);
+      // ─── MODIFIED: Pasamos ambientState al stream ────────────────────────
+      await streamTTSToTwilio(ttsText, va, streamSid, twilioWs, signal, ambientState);
+      // ─────────────────────────────────────────────────────────────────────
       if (signal?.aborted) pendingMark = false;
-
       if (shouldHangup) {
         const despedidaMs = Math.max(4000, (ttsText.length / 15) * 1000);
         console.log(`[voice-stream] Esperando ${Math.round(despedidaMs / 1000)}s antes de colgar...`);
@@ -477,12 +475,10 @@ wss.on('connection', (twilioWs, req) => {
     }
   }
 
-  // ─── LLM con keyManager: round-robin Azure → OpenAI fallback ─────────────
   async function callOpenAIWithDynamicTools(model, messages, tools, integrations, signal, retryCount = 0) {
     try {
       while (true) {
         if (signal?.aborted) return null;
-
         const { key, endpoint, isAzure, onSuccess, onFailure } = keyManager.getLLMKey();
         const apiUrl = isAzure
           ? `${endpoint}/openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${AZURE_OPENAI_API_VERSION}`
@@ -490,15 +486,12 @@ wss.on('connection', (twilioWs, req) => {
         const apiHeaders = isAzure
           ? { 'Content-Type': 'application/json', 'api-key': key }
           : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` };
-
         const requestBody = { max_tokens: 180, messages };
         if (!isAzure) requestBody.model = model;
         if (tools.length > 0) { requestBody.tools = tools; requestBody.tool_choice = 'auto'; }
-
         let res, data;
         res = await fetch(apiUrl, { method: 'POST', headers: apiHeaders, body: JSON.stringify(requestBody), signal });
         data = await res.json();
-
         if (res.status === 429 || res.status === 503) {
           onFailure(res.status);
           if (retryCount < 2) {
@@ -508,18 +501,15 @@ wss.on('connection', (twilioWs, req) => {
           }
           return 'Lo siento, ocurrió un error.';
         }
-
         if (!res.ok || data.error) {
           onFailure(res.status);
           console.error('[LLM] API error:', JSON.stringify(data.error ?? data));
           return 'Lo siento, ocurrió un error.';
         }
-
         onSuccess();
         const msg = data.choices?.[0]?.message;
         if (!msg) { console.error('[LLM] msg null, choices:', JSON.stringify(data.choices)); return 'Lo siento, ocurrió un error.'; }
         if (!msg.tool_calls || msg.tool_calls.length === 0) return msg.content?.trim() ?? 'Lo siento, ocurrió un error.';
-
         console.log(`[function-calling] LLM solicitó ${msg.tool_calls.length} tool(s)`);
         messages.push(msg);
         for (const toolCall of msg.tool_calls) {
@@ -559,7 +549,6 @@ wss.on('connection', (twilioWs, req) => {
     deepgramWs.on('error', (e) => console.error('[Deepgram] Error:', e.message));
     deepgramWs.on('close', () => console.log('[Deepgram] Cerrado'));
   }
-
   connectDeepgram();
 
   twilioWs.on('message', async (data) => {
@@ -577,7 +566,6 @@ wss.on('connection', (twilioWs, req) => {
       else if (resolvedPhone === '') resolvedPhone = normalizePhone(url.searchParams.get('phone') ?? '');
       if (params.from) callerPhone = normalizePhone(params.from);
       console.log(`[Twilio] start streamSid=${streamSid} callSid=${resolvedCallSid} to="${resolvedPhone}" from="${callerPhone}"`);
-
       fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${resolvedCallSid}/Recordings.json`, {
         method: 'POST',
         headers: { 'Authorization': 'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -587,65 +575,56 @@ wss.on('connection', (twilioWs, req) => {
         if (recData.sid) { recordingSid = recData.sid; console.log(`[Recording] Iniciada: ${recData.sid}`); }
         else { console.error('[Recording] Error iniciando:', JSON.stringify(recData)); }
       }).catch(e => console.error('[Recording] fetch error:', e.message));
-
       loadAssistant(resolvedPhone).then(async () => {
-        // ─── LIMIT ENFORCEMENT: check after assistant loads ──
         if (tenantId) {
           callLimits = await checkTenantLimits(supabase, tenantId);
-
           if (!callLimits.allowed) {
             console.log(`[limits] BLOCKED tenant=${tenantId} reason=${callLimits.reason}`);
-            // Play a short message then hang up
             if (va) {
               isSpeaking = true;
               pendingMark = true;
-              await streamTTSToTwilio('Lo siento, el servicio no está disponible en este momento. Por favor intenta más tarde.', va, streamSid, twilioWs, null);
+              await streamTTSToTwilio('Lo siento, el servicio no está disponible en este momento. Por favor intenta más tarde.', va, streamSid, twilioWs, null, ambientState);
             }
             setTimeout(() => hangupCall(), 4000);
             return;
           }
-
-          // Check concurrent calls
           const currentActive = getActiveCalls(tenantId);
           if (callLimits.max_concurrent > 0 && callLimits.max_concurrent < 999 && currentActive >= callLimits.max_concurrent) {
             console.log(`[limits] CONCURRENT LIMIT tenant=${tenantId} active=${currentActive} max=${callLimits.max_concurrent}`);
             if (va) {
               isSpeaking = true;
               pendingMark = true;
-              await streamTTSToTwilio('Todas nuestras líneas están ocupadas en este momento. Por favor intenta en unos minutos.', va, streamSid, twilioWs, null);
+              await streamTTSToTwilio('Todas nuestras líneas están ocupadas en este momento. Por favor intenta en unos minutos.', va, streamSid, twilioWs, null, ambientState);
             }
             setTimeout(() => hangupCall(), 4000);
             return;
           }
-
-          // Track this call
           trackCallStart(tenantId, resolvedCallSid);
-
-          // Set max duration timer (0 = unlimited for enterprise)
           if (callLimits.max_duration_seconds > 0) {
             const warningAt = Math.max(0, callLimits.max_duration_seconds - 15) * 1000;
-            // Warning 15s before cutoff
             setTimeout(async () => {
               if (callFinalized) return;
               console.log(`[limits] WARNING: 15s remaining for tenant=${tenantId}`);
-              // Inject a system-level nudge on next turn — the bot will wrap up naturally
             }, warningAt);
-
             maxDurationTimer = setTimeout(() => {
               if (callFinalized) return;
               console.log(`[limits] MAX DURATION reached tenant=${tenantId} limit=${callLimits.max_duration_seconds}s — hanging up`);
               hangupCall();
             }, callLimits.max_duration_seconds * 1000);
           }
-
           console.log(`[limits] OK tenant=${tenantId} maxDur=${callLimits.max_duration_seconds}s concurrent=${currentActive + 1}/${callLimits.max_concurrent} remaining=${Math.round(callLimits.minutes_remaining)}min`);
         }
-        // ─── END LIMIT ENFORCEMENT ───────────────────────────
-
         setTimeout(async () => {
           if (!va) { console.error('[voice-stream] va sigue null después de cargar'); return; }
           const greeting = va.greeting;
-          if (greeting) { console.log(`[voice-stream] Saludo: "${greeting}"`); isSpeaking = true; pendingMark = true; await streamTTSToTwilio(trimForTTS(greeting, 250), va, streamSid, twilioWs, null); }
+          if (greeting) {
+            console.log(`[voice-stream] Saludo: "${greeting}"`);
+            isSpeaking = true;
+            pendingMark = true;
+            // ─── MODIFIED: ambientState también va en el saludo ──────────────
+            await streamTTSToTwilio(trimForTTS(greeting, 250), va, streamSid, twilioWs, null, ambientState);
+            // ─────────────────────────────────────────────────────────────────
+          }
           else { console.log('[voice-stream] Sin greeting — esperando al usuario'); isSpeaking = false; pendingMark = false; }
         }, 300);
       });
@@ -665,11 +644,13 @@ wss.on('connection', (twilioWs, req) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[voice-stream] Listening on port ${PORT}`);
   console.log(`[KeyManager] Estado inicial:`, JSON.stringify(keyManager.getStatus(), null, 2));
+  console.log(`[ambient] Estado inicial:`, JSON.stringify(ambientMixer.getStatus(), null, 2));
 });
 
-// ─── TTS providers ────────────────────────────────────────────────────────────
+// ─── TTS providers — TODOS reciben ahora ambientState como último parámetro ──
+// Si ambientState es null o no está configurado, los chunks pasan sin modificación.
 
-async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_5', streamSid, twilioWs, signal) {
+async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_5', streamSid, twilioWs, signal, ambientState) {
   const { key, onSuccess, onFailure } = keyManager.getElevenLabsKey();
   try {
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`, {
@@ -692,16 +673,22 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
         while (leftover.length >= chunkSize) {
           if (signal?.aborted) { await reader.cancel(); return; }
           const toSend = leftover.slice(0, chunkSize); leftover = leftover.slice(chunkSize);
-          if (twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: toSend.toString('base64') } }));
+          // ─── NEW: Mix con ambient si está activo ─────────────────────────
+          const mixed = ambientMixer.mixChunk(toSend, ambientState);
+          // ─────────────────────────────────────────────────────────────────
+          if (twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mixed.toString('base64') } }));
         }
       }
     } finally { reader.releaseLock(); }
-    if (!signal?.aborted && leftover.length > 0 && twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: leftover.toString('base64') } }));
+    if (!signal?.aborted && leftover.length > 0 && twilioWs.readyState === WebSocket.OPEN) {
+      const mixed = ambientMixer.mixChunk(leftover, ambientState);
+      twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mixed.toString('base64') } }));
+    }
     if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
   } catch (err) { if (err.name !== 'AbortError') console.error('[ElevenLabs stream] Error:', err.message); }
 }
 
-async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', streamSid, twilioWs, signal) {
+async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', streamSid, twilioWs, signal, ambientState) {
   const { key, onSuccess, onFailure } = keyManager.getLLMKey();
   try {
     console.log(`[OpenAI TTS] voz=${voice} modelo=${model}`);
@@ -721,13 +708,17 @@ async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', s
     const chunkSize = 640;
     for (let i = 0; i < mulawBuffer.length; i += chunkSize) {
       if (signal?.aborted) return;
-      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mulawBuffer.slice(i, i + chunkSize).toString('base64') } }));
+      const chunk = mulawBuffer.slice(i, i + chunkSize);
+      // ─── NEW: Mix con ambient ────────────────────────────────────────────
+      const mixed = ambientMixer.mixChunk(chunk, ambientState);
+      // ─────────────────────────────────────────────────────────────────────
+      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mixed.toString('base64') } }));
     }
     if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
   } catch (err) { if (err.name !== 'AbortError') console.error('[OpenAI TTS] Error:', err.message); }
 }
 
-async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', languageCode = 'es-US', streamSid, twilioWs, signal) {
+async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', languageCode = 'es-US', streamSid, twilioWs, signal, ambientState) {
   const { key: googleKey, onSuccess, onFailure } = keyManager.getGoogleKey();
   try {
     console.log(`[Google TTS] voz=${voice} idioma=${languageCode}`);
@@ -752,7 +743,11 @@ async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', language
     const chunkSize = 640;
     for (let i = 0; i < mulawBuffer.length; i += chunkSize) {
       if (signal?.aborted) return;
-      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mulawBuffer.slice(i, i + chunkSize).toString('base64') } }));
+      const chunk = mulawBuffer.slice(i, i + chunkSize);
+      // ─── NEW: Mix con ambient ────────────────────────────────────────────
+      const mixed = ambientMixer.mixChunk(chunk, ambientState);
+      // ─────────────────────────────────────────────────────────────────────
+      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mixed.toString('base64') } }));
     }
     if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
   } catch (err) { if (err.name !== 'AbortError') console.error('[Google TTS] Error:', err.message); }
