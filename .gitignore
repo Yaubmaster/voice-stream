@@ -1,0 +1,10 @@
+.env
+.env.save
+google-tts-key.json
+node_modules/
+*.backup
+*.backup-*
+*.bak
+*.local-bkp
+*.new
+*.040716
