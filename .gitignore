@@ -8,3 +8,7 @@ node_modules/
 *.local-bkp
 *.new
 *.040716
+
+*backup*
+*bkp*
+*.log

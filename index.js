@@ -206,14 +206,14 @@ function convertMp3ToMulaw(inputBuffer) {
   });
 }
 
-// ─── MODIFIED: streamTTSToTwilio ahora pasa ambientState a los providers ─────
-async function streamTTSToTwilio(text, va, streamSid, twilioWs, signal, ambientState) {
+// ─── MODIFIED: streamTTSToTwilio ahora pasa ambientState y isBrowser a los providers ─────
+async function streamTTSToTwilio(text, va, streamSid, twilioWs, signal, ambientState, isBrowser = false) {
   const provider = va.tts_provider ?? 'elevenlabs';
-  console.log(`[TTS] Proveedor: ${provider}${ambientState ? ` ambient=${ambientState.type}@${(ambientState.volume * 100).toFixed(0)}%` : ''}`);
-  if (provider === 'deepgram') await streamDeepgramTTSToTwilio(text, va.deepgram_aura_voice ?? 'aura-2-carina-es', streamSid, twilioWs, signal, ambientState);
-  else if (provider === 'openai') await streamOpenAITTSToTwilio(text, va.openai_voice ?? 'alloy', va.openai_tts_model ?? 'tts-1', streamSid, twilioWs, signal, ambientState);
-  else if (provider === 'google') await streamGoogleTTSToTwilio(text, va.google_tts_voice ?? 'es-US-Wavenet-B', va.google_tts_language ?? 'es-US', streamSid, twilioWs, signal, ambientState);
-  else await streamElevenLabsToTwilio(text, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs, signal, ambientState);
+  console.log(`[TTS] Proveedor: ${provider}${ambientState ? ` ambient=${ambientState.type}@${(ambientState.volume * 100).toFixed(0)}%` : ''} isBrowser=${isBrowser}`);
+  if (provider === 'deepgram') await streamDeepgramTTSToTwilio(text, va.deepgram_aura_voice ?? 'aura-2-carina-es', streamSid, twilioWs, signal, ambientState, isBrowser);
+  else if (provider === 'openai') await streamOpenAITTSToTwilio(text, va.openai_voice ?? 'alloy', va.openai_tts_model ?? 'tts-1', streamSid, twilioWs, signal, ambientState, isBrowser);
+  else if (provider === 'google') await streamGoogleTTSToTwilio(text, va.google_tts_voice ?? 'es-US-Wavenet-B', va.google_tts_language ?? 'es-US', streamSid, twilioWs, signal, ambientState, isBrowser);
+  else await streamElevenLabsToTwilio(text, va.elevenlabs_voice_id, va.elevenlabs_model, streamSid, twilioWs, signal, ambientState, isBrowser);
 }
 
 function buildToolsFromIntegrations(integrations) {
@@ -367,18 +367,26 @@ function createDeepgramConnection() {
 }
 
 wss.on('connection', (twilioWs, req) => {
-  const twilioSignature = req.headers['x-twilio-signature'] ?? '';
-  const fullUrl = `https://stream.yaub.ai${req.url}`;
-  const isValid = validateRequest(TWILIO_AUTH_TOKEN, twilioSignature, fullUrl, {});
-  if (false && !isValid) { console.warn('[Security] MONITOR - firma invalida:', req.url); }
-  console.log('[Security] Firma Twilio validada OK');
+  const url = new URL(req.url, 'http://localhost');
+  const source = url.searchParams.get('source') ?? 'twilio';
+  const isBrowser = source === 'browser';
+
+  if (!isBrowser) {
+    const twilioSignature = req.headers['x-twilio-signature'] ?? '';
+    const fullUrl = `https://stream.yaub.ai${req.url}`;
+    const isValid = validateRequest(TWILIO_AUTH_TOKEN, twilioSignature, fullUrl, {});
+    if (false && !isValid) { console.warn('[Security] MONITOR - firma invalida:', req.url); }
+    console.log('[Security] Firma Twilio validada OK');
+  } else {
+    console.log('[Security] Conexión de navegador (bypass Twilio signature)');
+  }
   console.log('[voice-stream] Nueva conexión WS recibida:', req.url);
 
-  const url = new URL(req.url, 'http://localhost');
-  const callSid = url.searchParams.get('call_sid') ?? '';
+  const assistantId = url.searchParams.get('assistant_id') ?? '';
+  const callSid = url.searchParams.get('call_sid') ?? (isBrowser ? `browser_${Math.random().toString(36).slice(2, 10)}` : '');
   const phoneParam = normalizePhone(url.searchParams.get('phone') ?? '');
-  let callerPhone = normalizePhone(url.searchParams.get('from') ?? '');
-  console.log(`[voice-stream] callSid=${callSid} to=${phoneParam} from=${callerPhone}`);
+  let callerPhone = normalizePhone(url.searchParams.get('from') ?? (isBrowser ? 'browser_user' : ''));
+  console.log(`[voice-stream] source=${source} callSid=${callSid} to=${phoneParam} from=${callerPhone} assistantId=${assistantId}`);
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
   let streamSid = '';
@@ -398,6 +406,22 @@ wss.on('connection', (twilioWs, req) => {
   // ─── NEW: Per-call ambient state ───────────────────────────────────────────
   let ambientState = null;
   // ───────────────────────────────────────────────────────────────────────────
+
+  if (isBrowser) {
+    console.log('[voice-stream] Browser connection: Triggering automatic start');
+    loadAssistant(resolvedPhone, assistantId).then(() => {
+      setTimeout(async () => {
+        if (!va) { console.error('[voice-stream] va sigue null (browser)'); return; }
+        const greeting = va.greeting;
+        if (greeting) {
+          console.log(`[voice-stream] Saludo (browser): "${greeting}"`);
+          isSpeaking = true; pendingMark = true;
+          sendAudio(twilioWs, { event: 'transcript', role: 'assistant', text: greeting, isFinal: true }, true);
+          await streamTTSToTwilio(trimForTTS(greeting, 250), va, streamSid, twilioWs, null, ambientState, true);
+        }
+      }, 500);
+    });
+  }
 
   let katuzSessionId = null;
   let katuzEnabled = false;
@@ -512,12 +536,21 @@ wss.on('connection', (twilioWs, req) => {
     }
   }
 
-  function loadAssistant(phone) {
-    console.log(`[loadAssistant] buscando phone="${phone}"`);
-    return supabase.from('voice_assistants').select('*, assistants(id, name, prompt, llm_model, tenant_id, dashboard_type, outcome_variables)').eq('twilio_phone_number', phone).eq('is_active', true).single()
+  function loadAssistant(phone, assistantId = null) {
+    console.log(`[loadAssistant] buscando phone="${phone}" assistantId="${assistantId}"`);
+    let query = supabase.from('voice_assistants').select('*, assistants(id, name, prompt, llm_model, tenant_id, dashboard_type, outcome_variables)').eq('is_active', true);
+    
+    if (assistantId) {
+      query = query.eq('assistant_id', assistantId);
+    } else {
+      query = query.eq('twilio_phone_number', phone);
+    }
+
+    return query.single()
       .then(({ data, error }) => {
         va = data;
         console.log(`[loadAssistant] resultado: ${va?.assistants?.name ?? 'null'} tipo: ${va?.assistants?.dashboard_type ?? 'atencion'} integraciones: ${va?.integrations?.length ?? 0} error: ${error?.message ?? 'none'}`);
+        // ... (ambient noise logic remains same)
 
         // ─── NEW: Initialize ambient state if enabled for this assistant ─────
         if (va?.ambient_noise_enabled === true) {
@@ -558,8 +591,14 @@ wss.on('connection', (twilioWs, req) => {
       if (signal?.aborted) return;
 
       const rawPrompt = va.assistants?.prompt ?? 'Eres un asistente útil.';
+      // Strip international prefix (+52, +1, etc.) to get clean 10-digit number
+      const cleanPhone = (callerPhone || '').replace(/\D/g, '').slice(-10);
+      const phoneLast4 = cleanPhone.length >= 4 ? cleanPhone.slice(-4) : cleanPhone;
+      const phoneLast4Pairs = phoneLast4.length === 4 ? `${phoneLast4.slice(0,2)}, ${phoneLast4.slice(2,4)}` : phoneLast4;
       const systemPrompt = rawPrompt
-        .replace(/\{\{phone\}\}/g, callerPhone || 'desconocido')
+        .replace(/\{\{phone\}\}/g, cleanPhone || 'desconocido')
+        .replace(/\{\{phone_last4\}\}/g, phoneLast4)
+        .replace(/\{\{phone_last4_pairs\}\}/g, phoneLast4Pairs)
         .replace(/\{\{call_sid\}\}/g, resolvedCallSid || '');
 
       const model = va.assistants?.llm_model ?? 'gpt-4o-mini';
@@ -583,6 +622,8 @@ wss.on('connection', (twilioWs, req) => {
       katuzEmitTranscript('asesor', cleanReply);
       katuzAnalyze('asesor', cleanReply);
 
+      if (isBrowser) sendAudio(twilioWs, { event: 'transcript', role: 'assistant', text: cleanReply, isFinal: true }, true);
+
       const ttsText = trimForTTS(cleanReply, 250);
 
       history.push({ role: 'user', text: transcript, ts: new Date().toISOString() }, { role: 'assistant', text: cleanReply, ts: new Date().toISOString() });
@@ -591,7 +632,7 @@ wss.on('connection', (twilioWs, req) => {
       if (signal?.aborted) return;
       pendingMark = true;
       // ─── MODIFIED: Pasamos ambientState al stream ────────────────────────
-      await streamTTSToTwilio(ttsText, va, streamSid, twilioWs, signal, ambientState);
+      await streamTTSToTwilio(ttsText, va, streamSid, twilioWs, signal, ambientState, isBrowser);
       // ─────────────────────────────────────────────────────────────────────
       if (signal?.aborted) pendingMark = false;
 
@@ -656,7 +697,11 @@ wss.on('connection', (twilioWs, req) => {
           const toolName = toolCall.function.name;
           const toolParams = JSON.parse(toolCall.function.arguments);
           const integration = integrations.find(i => i.name === toolName);
+          
+          if (isBrowser) sendAudio(twilioWs, { event: 'tool_call', name: toolName, params: toolParams }, true);
           const toolResult = integration ? await callDynamicIntegration(integration, toolParams, resolvedCallSid, supabase) : { error: `Integración "${toolName}" no encontrada` };
+          if (isBrowser) sendAudio(twilioWs, { event: 'tool_result', name: toolName, result: toolResult }, true);
+
           messages.push({ role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify(toolResult) });
         }
       }
@@ -675,8 +720,13 @@ wss.on('connection', (twilioWs, req) => {
       const transcript = msg?.channel?.alternatives?.[0]?.transcript ?? '';
       const isFinal = msg?.is_final === true;
       if (!transcript.trim()) return;
-      if (!isFinal) { if (isSpeaking) { interruptSpeaking(); console.log('[barge-in] Interim — bot cortado'); } return; }
+      if (!isFinal) { 
+        if (isSpeaking) { interruptSpeaking(); console.log('[barge-in] Interim — bot cortado'); } 
+        if (isBrowser) sendAudio(twilioWs, { event: 'transcript', text: transcript, isFinal: false }, true);
+        return; 
+      }
       console.log(`[Deepgram] Transcript final: "${transcript}"`);
+      if (isBrowser) sendAudio(twilioWs, { event: 'transcript', text: transcript, isFinal: true }, true);
       if (isSpeaking) { interruptSpeaking(); await new Promise(r => setTimeout(r, 150)); }
       isSpeaking = true;
       const controller = new AbortController();
@@ -717,7 +767,7 @@ wss.on('connection', (twilioWs, req) => {
         else { console.error('[Recording] Error iniciando:', JSON.stringify(recData)); }
       }).catch(e => console.error('[Recording] fetch error:', e.message));
 
-      loadAssistant(resolvedPhone).then(() => {
+      loadAssistant(resolvedPhone, assistantId).then(() => {
         setTimeout(async () => {
           if (!va) { console.error('[voice-stream] va sigue null después de cargar'); return; }
           const greeting = va.greeting;
@@ -725,8 +775,9 @@ wss.on('connection', (twilioWs, req) => {
             console.log(`[voice-stream] Saludo: "${greeting}"`);
             isSpeaking = true;
             pendingMark = true;
-            // ─── MODIFIED: ambientState también va en el saludo ──────────────
-            await streamTTSToTwilio(trimForTTS(greeting, 250), va, streamSid, twilioWs, null, ambientState);
+            if (isBrowser) sendAudio(twilioWs, { event: 'transcript', role: 'assistant', text: greeting, isFinal: true }, true);
+            // ─── MODIFIED: ambientState y isBrowser también van en el saludo ──────────────
+            await streamTTSToTwilio(trimForTTS(greeting, 250), va, streamSid, twilioWs, null, ambientState, isBrowser);
             // ─────────────────────────────────────────────────────────────────
           }
           else { console.log('[voice-stream] Sin greeting — esperando al usuario'); isSpeaking = false; pendingMark = false; }
@@ -735,8 +786,18 @@ wss.on('connection', (twilioWs, req) => {
     }
     if (msg.event === 'media') {
       const payload = msg.media?.payload ?? '';
-      if (isDeepgramReady && deepgramWs?.readyState === WebSocket.OPEN) deepgramWs.send(Buffer.from(payload, 'base64'));
+      if (isDeepgramReady && deepgramWs?.readyState === WebSocket.OPEN) {
+        // Si es navegador, el payload podría venir ya en binario o base64 mulaw.
+        // Asumiremos que el navegador manda base64 mulaw para consistencia con Twilio por ahora,
+        // o podemos detectar si es binario.
+        deepgramWs.send(Buffer.from(payload, 'base64'));
+      }
       else audioBuffer.push(payload);
+    }
+    // NUEVO: Soporte para audio binario directo del navegador
+    if (Buffer.isBuffer(data) && isBrowser) {
+      if (isDeepgramReady && deepgramWs?.readyState === WebSocket.OPEN) deepgramWs.send(data);
+      else audioBuffer.push(data.toString('base64'));
     }
     if (msg.event === 'stop') { console.log('[Twilio] stop'); interruptSpeaking(); deepgramWs?.close(); await finalizeCall(); }
   });
@@ -752,9 +813,15 @@ server.listen(PORT, '0.0.0.0', () => {
 });
 
 // ─── TTS providers ────────────────────────────────────────────────────────────
-// Todos reciben ambientState como último parámetro. Si es null → no se mezcla nada.
+// Todos reciben ambientState y isBrowser como últimos parámetros.
 
-async function streamDeepgramTTSToTwilio(text, voice = 'aura-2-carina-es', streamSid, twilioWs, signal, ambientState) {
+function sendAudio(ws, eventData, isBrowser) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  // El navegador recibe el mismo formato JSON que Twilio para simplicidad
+  ws.send(JSON.stringify(eventData));
+}
+
+async function streamDeepgramTTSToTwilio(text, voice = 'aura-2-carina-es', streamSid, twilioWs, signal, ambientState, isBrowser = false) {
   const { key, onSuccess, onFailure } = keyManager.getDeepgramKey();
   try {
     console.log(`[Deepgram TTS] voz=${voice} texto="${text.slice(0, 60)}..."`);
@@ -779,19 +846,19 @@ async function streamDeepgramTTSToTwilio(text, voice = 'aura-2-carina-es', strea
           if (signal?.aborted) { await reader.cancel(); return; }
           const toSend = leftover.slice(0, chunkSize); leftover = leftover.slice(chunkSize);
           const mixed = ambientMixer.mixChunk(toSend, ambientState);
-          if (twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mixed.toString('base64') } }));
+          sendAudio(twilioWs, { event: 'media', streamSid, media: { payload: mixed.toString('base64') } }, isBrowser);
         }
       }
     } finally { reader.releaseLock(); }
-    if (!signal?.aborted && leftover.length > 0 && twilioWs.readyState === WebSocket.OPEN) {
+    if (!signal?.aborted && leftover.length > 0) {
       const mixed = ambientMixer.mixChunk(leftover, ambientState);
-      twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mixed.toString('base64') } }));
+      sendAudio(twilioWs, { event: 'media', streamSid, media: { payload: mixed.toString('base64') } }, isBrowser);
     }
-    if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
+    if (!signal?.aborted) sendAudio(twilioWs, { event: 'mark', streamSid, mark: { name: 'end-of-response' } }, isBrowser);
   } catch (err) { if (err.name !== 'AbortError') console.error('[Deepgram TTS] Error:', err.message); }
 }
 
-async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_5', streamSid, twilioWs, signal, ambientState) {
+async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_5', streamSid, twilioWs, signal, ambientState, isBrowser = false) {
   const { key, onSuccess, onFailure } = keyManager.getElevenLabsKey();
   try {
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`, {
@@ -815,19 +882,19 @@ async function streamElevenLabsToTwilio(text, voiceId, model = 'eleven_turbo_v2_
           if (signal?.aborted) { await reader.cancel(); return; }
           const toSend = leftover.slice(0, chunkSize); leftover = leftover.slice(chunkSize);
           const mixed = ambientMixer.mixChunk(toSend, ambientState);
-          if (twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mixed.toString('base64') } }));
+          sendAudio(twilioWs, { event: 'media', streamSid, media: { payload: mixed.toString('base64') } }, isBrowser);
         }
       }
     } finally { reader.releaseLock(); }
-    if (!signal?.aborted && leftover.length > 0 && twilioWs.readyState === WebSocket.OPEN) {
+    if (!signal?.aborted && leftover.length > 0) {
       const mixed = ambientMixer.mixChunk(leftover, ambientState);
-      twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mixed.toString('base64') } }));
+      sendAudio(twilioWs, { event: 'media', streamSid, media: { payload: mixed.toString('base64') } }, isBrowser);
     }
-    if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
+    if (!signal?.aborted) sendAudio(twilioWs, { event: 'mark', streamSid, mark: { name: 'end-of-response' } }, isBrowser);
   } catch (err) { if (err.name !== 'AbortError') console.error('[ElevenLabs stream] Error:', err.message); }
 }
 
-async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', streamSid, twilioWs, signal, ambientState) {
+async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', streamSid, twilioWs, signal, ambientState, isBrowser = false) {
   const { key, onSuccess, onFailure } = keyManager.getLLMKey();
   try {
     console.log(`[OpenAI TTS] voz=${voice} modelo=${model}`);
@@ -849,13 +916,13 @@ async function streamOpenAITTSToTwilio(text, voice = 'alloy', model = 'tts-1', s
       if (signal?.aborted) return;
       const chunk = mulawBuffer.slice(i, i + chunkSize);
       const mixed = ambientMixer.mixChunk(chunk, ambientState);
-      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mixed.toString('base64') } }));
+      sendAudio(twilioWs, { event: 'media', streamSid, media: { payload: mixed.toString('base64') } }, isBrowser);
     }
-    if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
+    if (!signal?.aborted) sendAudio(twilioWs, { event: 'mark', streamSid, mark: { name: 'end-of-response' } }, isBrowser);
   } catch (err) { if (err.name !== 'AbortError') console.error('[OpenAI TTS] Error:', err.message); }
 }
 
-async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', languageCode = 'es-US', streamSid, twilioWs, signal, ambientState) {
+async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', languageCode = 'es-US', streamSid, twilioWs, signal, ambientState, isBrowser = false) {
   const { key: googleKey, onSuccess, onFailure } = keyManager.getGoogleKey();
   try {
     console.log(`[Google TTS] voz=${voice} idioma=${languageCode}`);
@@ -882,8 +949,8 @@ async function streamGoogleTTSToTwilio(text, voice = 'es-US-Wavenet-B', language
       if (signal?.aborted) return;
       const chunk = mulawBuffer.slice(i, i + chunkSize);
       const mixed = ambientMixer.mixChunk(chunk, ambientState);
-      if (twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mixed.toString('base64') } }));
+      sendAudio(twilioWs, { event: 'media', streamSid, media: { payload: mixed.toString('base64') } }, isBrowser);
     }
-    if (!signal?.aborted && twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'end-of-response' } }));
+    if (!signal?.aborted) sendAudio(twilioWs, { event: 'mark', streamSid, mark: { name: 'end-of-response' } }, isBrowser);
   } catch (err) { if (err.name !== 'AbortError') console.error('[Google TTS] Error:', err.message); }
 }
