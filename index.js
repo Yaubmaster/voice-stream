@@ -417,7 +417,7 @@ wss.on('connection', (twilioWs, req) => {
           console.log(`[voice-stream] Saludo (browser): "${greeting}"`);
           isSpeaking = true; pendingMark = true;
           sendAudio(twilioWs, { event: 'transcript', role: 'assistant', text: greeting, isFinal: true }, true);
-          await streamTTSToTwilio(trimForTTS(greeting, 250), va, streamSid, twilioWs, null, ambientState, true);
+          await streamTTSToTwilio(greeting, va, streamSid, twilioWs, null, ambientState, true);
         }
       }, 500);
     });
@@ -793,7 +793,7 @@ wss.on('connection', (twilioWs, req) => {
             pendingMark = true;
             if (isBrowser) sendAudio(twilioWs, { event: 'transcript', role: 'assistant', text: greeting, isFinal: true }, true);
             // ─── MODIFIED: ambientState y isBrowser también van en el saludo ──────────────
-            await streamTTSToTwilio(trimForTTS(greeting, 250), va, streamSid, twilioWs, null, ambientState, isBrowser);
+            await streamTTSToTwilio(greeting, va, streamSid, twilioWs, null, ambientState, isBrowser);
             // ─────────────────────────────────────────────────────────────────
           }
           else { console.log('[voice-stream] Sin greeting — esperando al usuario'); isSpeaking = false; pendingMark = false; }
