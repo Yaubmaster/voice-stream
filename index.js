@@ -803,18 +803,15 @@ wss.on('connection', (twilioWs, req) => {
     if (msg.event === 'media') {
       const payload = msg.media?.payload ?? '';
       if (isDeepgramReady && deepgramWs?.readyState === WebSocket.OPEN) {
-        // Si es navegador, el payload podría venir ya en binario o base64 mulaw.
-        // Asumiremos que el navegador manda base64 mulaw para consistencia con Twilio por ahora,
-        // o podemos detectar si es binario.
         deepgramWs.send(Buffer.from(payload, 'base64'));
       }
       else audioBuffer.push(payload);
     }
-    // NUEVO: Soporte para audio binario directo del navegador
-    if (Buffer.isBuffer(data) && isBrowser) {
-      if (isDeepgramReady && deepgramWs?.readyState === WebSocket.OPEN) deepgramWs.send(data);
-      else audioBuffer.push(data.toString('base64'));
-    }
+    // NOTE: A previous "binary audio passthrough" branch lived here. It was
+    // unconditionally re-sending the raw WebSocket frame (always a Buffer of
+    // the JSON string) to Deepgram alongside the actual mulaw payload, which
+    // poisoned Deepgram's input with garbage bytes and prevented any speech
+    // detection from browser sources. Removed.
     if (msg.event === 'stop') { console.log('[Twilio] stop'); interruptSpeaking(); deepgramWs?.close(); await finalizeCall(); }
   });
 
