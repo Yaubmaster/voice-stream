@@ -444,6 +444,21 @@ wss.on('connection', (twilioWs, req) => {
     } catch (err) { console.error('[Katuz] emit transcript error:', err.message); }
   }
 
+  async function katuzEmitToolCall(toolCalls) {
+    if (!katuzEnabled || !katuzSessionId) return;
+    try {
+      await supabase.from('katuz_events').insert({
+        session_id: katuzSessionId,
+        tenant_id: katuzTenantId,
+        event_type: 'tool_call',
+        speaker: 'asesor',
+        content: `Ejecutando ${toolCalls.length} herramientas`,
+        metadata: { tool_calls: toolCalls },
+        ts_offset_ms: Date.now() - callStartTime,
+      });
+    } catch (err) { console.error('[Katuz] emit tool call error:', err.message); }
+  }
+
   async function katuzAnalyze(speaker, text) {
     if (!katuzEnabled || !katuzSessionId) return;
     fetch(KATUZ_ENGINE_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` }, body: JSON.stringify({ session_id: katuzSessionId, tenant_id: katuzTenantId, speaker, text, turn: katuzTurnCount, ts_offset_ms: Date.now() - callStartTime }) }).catch(err => console.error('[Katuz] analyze error:', err.message));
@@ -692,6 +707,7 @@ wss.on('connection', (twilioWs, req) => {
 
         console.log(`[function-calling] LLM solicitó ${msg.tool_calls.length} tool(s)`);
         messages.push(msg);
+        katuzEmitToolCall(msg.tool_calls);
         for (const toolCall of msg.tool_calls) {
           if (signal?.aborted) return null;
           const toolName = toolCall.function.name;
