@@ -417,6 +417,7 @@ wss.on('connection', (twilioWs, req) => {
           console.log(`[voice-stream] Saludo (browser): "${greeting}"`);
           isSpeaking = true; pendingMark = true;
           sendAudio(twilioWs, { event: 'transcript', role: 'assistant', text: greeting, isFinal: true }, true);
+          _browserHistory.push({ role: 'assistant', text: greeting, ts: new Date().toISOString() });
           await streamTTSToTwilio(greeting, va, streamSid, twilioWs, null, ambientState, true);
         }
       }, 500);
@@ -427,6 +428,12 @@ wss.on('connection', (twilioWs, req) => {
   let katuzEnabled = false;
   let katuzTurnCount = 0;
   let katuzTenantId = null;
+
+  // Browser playground sessions don't have a row in voice_calls (Twilio is the
+  // only writer). Without persisted history every turn arrives with empty
+  // context and the LLM resets the conversation. Keep an in-memory transcript
+  // for the lifetime of the WS connection and use it instead of the DB read.
+  const _browserHistory = [];
 
   async function katuzCreateSession(voiceCallId, tenantId, assistantId) {
     try {
@@ -599,9 +606,16 @@ wss.on('connection', (twilioWs, req) => {
       katuzEmitTranscript('cliente', transcript);
       katuzAnalyze('cliente', transcript);
 
-      const { data: call } = await supabase.from('voice_calls').select('transcript, turn_count').eq('call_sid', resolvedCallSid).single();
-      const history = call?.transcript ?? [];
-      const turnCount = (call?.turn_count ?? 0) + 1;
+      let history;
+      let turnCount;
+      if (isBrowser) {
+        history = _browserHistory;
+        turnCount = Math.floor(_browserHistory.length / 2) + 1;
+      } else {
+        const { data: call } = await supabase.from('voice_calls').select('transcript, turn_count').eq('call_sid', resolvedCallSid).single();
+        history = call?.transcript ?? [];
+        turnCount = (call?.turn_count ?? 0) + 1;
+      }
       const historyMessages = history.map(t => ({ role: t.role === 'user' ? 'user' : 'assistant', content: t.text }));
       if (signal?.aborted) return;
 
@@ -642,7 +656,9 @@ wss.on('connection', (twilioWs, req) => {
       const ttsText = trimForTTS(cleanReply, 250);
 
       history.push({ role: 'user', text: transcript, ts: new Date().toISOString() }, { role: 'assistant', text: cleanReply, ts: new Date().toISOString() });
-      supabase.from('voice_calls').update({ transcript: history, turn_count: turnCount, last_activity_at: new Date().toISOString() }).eq('call_sid', resolvedCallSid).then(() => {});
+      if (!isBrowser) {
+        supabase.from('voice_calls').update({ transcript: history, turn_count: turnCount, last_activity_at: new Date().toISOString() }).eq('call_sid', resolvedCallSid).then(() => {});
+      }
 
       if (signal?.aborted) return;
       pendingMark = true;
