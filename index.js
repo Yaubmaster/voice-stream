@@ -418,7 +418,15 @@ wss.on('connection', (twilioWs, req) => {
           isSpeaking = true; pendingMark = true;
           sendAudio(twilioWs, { event: 'transcript', role: 'assistant', text: greeting, isFinal: true }, true);
           _browserHistory.push({ role: 'assistant', text: greeting, ts: new Date().toISOString() });
-          await streamTTSToTwilio(greeting, va, streamSid, twilioWs, null, ambientState, true);
+          // ─── FIX barge-in: el saludo debe ser abortable (registrar controller) ─────
+          const greetController = new AbortController();
+          currentAbortController = greetController;
+          try {
+            await streamTTSToTwilio(greeting, va, streamSid, twilioWs, greetController.signal, ambientState, true);
+          } finally {
+            if (currentAbortController === greetController) currentAbortController = null;
+          }
+          // ───────────────────────────────────────────────────────────────────────────
         }
       }, 500);
     });
@@ -752,10 +760,12 @@ wss.on('connection', (twilioWs, req) => {
       const transcript = msg?.channel?.alternatives?.[0]?.transcript ?? '';
       const isFinal = msg?.is_final === true;
       if (!transcript.trim()) return;
-      if (!isFinal) { 
-        if (isSpeaking) { interruptSpeaking(); console.log('[barge-in] Interim — bot cortado'); } 
+      if (!isFinal) {
+        // FIX barge-in: exigir señal mínima (>=2 chars) antes de cortar, para que el eco
+        // del propio TTS o ruidos sueltos no auto-interrumpan al bot. "sí"/"no" pasan.
+        if (isSpeaking && transcript.trim().length >= 2) { interruptSpeaking(); console.log('[barge-in] Interim — bot cortado'); }
         if (isBrowser) sendAudio(twilioWs, { event: 'transcript', text: transcript, isFinal: false }, true);
-        return; 
+        return;
       }
       console.log(`[Deepgram] Transcript final: "${transcript}"`);
       if (isBrowser) sendAudio(twilioWs, { event: 'transcript', text: transcript, isFinal: true }, true);
@@ -808,8 +818,16 @@ wss.on('connection', (twilioWs, req) => {
             isSpeaking = true;
             pendingMark = true;
             if (isBrowser) sendAudio(twilioWs, { event: 'transcript', role: 'assistant', text: greeting, isFinal: true }, true);
-            // ─── MODIFIED: ambientState y isBrowser también van en el saludo ──────────────
-            await streamTTSToTwilio(greeting, va, streamSid, twilioWs, null, ambientState, isBrowser);
+            // ─── FIX barge-in: el saludo debe ser abortable. Antes se pasaba signal=null,
+            //     así el `clear` no frenaba el stream y el bot hablaba encima del cliente
+            //     durante la apertura (típico en salientes de cobranza). ──────────────────
+            const greetController = new AbortController();
+            currentAbortController = greetController;
+            try {
+              await streamTTSToTwilio(greeting, va, streamSid, twilioWs, greetController.signal, ambientState, isBrowser);
+            } finally {
+              if (currentAbortController === greetController) currentAbortController = null;
+            }
             // ─────────────────────────────────────────────────────────────────
           }
           else { console.log('[voice-stream] Sin greeting — esperando al usuario'); isSpeaking = false; pendingMark = false; }
